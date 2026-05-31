@@ -10,7 +10,7 @@
 # gen-index.sh), grouped service -> version -> [platforms]:
 #
 #   {"schema":1,"services":{"redis":{"versions":[
-#       {"version":"8","platforms":["linux-aarch64","linux-x86_64","macos-aarch64","macos-x86_64"]}
+#       {"version":"8","platforms":["linux-aarch64","linux-x86_64","macos-aarch64"]}
 #   ]}}}
 #
 # It carries only what filenames encode (service, version, platforms) — no

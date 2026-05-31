@@ -40,7 +40,7 @@ Both are one `gh workflow run` (or the Actions **Run workflow** button, or an ag
 # Release a NEW version — e.g. Valkey 8.1 lands upstream:
 gh workflow run release.yml \
   -f action=build -f service=valkey -f version=8.1 -f upstream=8.1.0
-#  → builds 4 platforms, uploads redis-8.1-*.tar.gz, refreshes index.html + services.json.
+#  → builds all platforms, uploads redis-8.1-*.tar.gz, refreshes index.html + services.json.
 #    Everything else (redis 8, mysql, …) is untouched.
 
 # EXCLUDE a bad version — e.g. pull Valkey 8.0:
@@ -104,7 +104,7 @@ additive and nothing in `forjedio/yerd` depends on it.
 { "schema": 1,
   "services": {
     "redis": { "versions": [
-      { "version": "8", "platforms": ["linux-aarch64","linux-x86_64","macos-aarch64","macos-x86_64"] }
+      { "version": "8", "platforms": ["linux-aarch64","linux-x86_64","macos-aarch64"] }
     ] } } }
 ```
 
@@ -150,7 +150,8 @@ yerd-services/
 |-----------------|-------------------|
 | `linux-x86_64`  | `ubuntu-latest`   |
 | `linux-aarch64` | `ubuntu-24.04-arm`|
-| `macos-x86_64`  | `macos-13`        |
 | `macos-aarch64` | `macos-14`        |
 
-(Windows is out of scope — mac/Linux-first, matching the main repo.)
+**macOS is arm64 (Apple Silicon) only.** GitHub retired the last Intel macOS image
+(`macos-13`) in December 2025, and `macos-14`/`macos-15` are arm64-only, so we do not ship a
+`macos-x86_64` artifact. (Windows is also out of scope — mac/Linux-first, matching the main repo.)

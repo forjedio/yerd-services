@@ -5,9 +5,9 @@ name: release
 #
 # Atomic publish: build legs only emit per-platform GitHub Actions *artifacts*;
 # the single `finalize` job (which runs only when ALL legs succeed) downloads them
-# and uploads all four to the release together, then regenerates the listing. So a
-# partial build failure publishes NOTHING and leaves the live release untouched —
-# the listing always reflects reality.
+# and uploads every platform to the release together, then regenerates the listing.
+# So a partial build failure publishes NOTHING and leaves the live release
+# untouched — the listing always reflects reality.
 on:
   workflow_dispatch:
     inputs:
@@ -68,10 +68,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # macOS x86_64 is intentionally omitted: GitHub retired the last Intel
+        # macOS image (macos-13) in Dec 2025, and macos-14/15 are arm64-only.
+        # macOS ships arm64 binaries only.
         include:
           - { runner: ubuntu-latest,    target: linux-x86_64 }
           - { runner: ubuntu-24.04-arm, target: linux-aarch64 }
-          - { runner: macos-13,         target: macos-x86_64 }
           - { runner: macos-14,         target: macos-aarch64 }
     runs-on: ${{ matrix.runner }}
     steps:
@@ -119,7 +121,7 @@ jobs:
           if [[ ${#files[@]} -eq 0 ]]; then
             echo "no artifacts downloaded to publish" >&2; exit 1
           fi
-          # All four land before any listing change; --clobber replaces same-named assets.
+          # All platforms land before any listing change; --clobber replaces same-named assets.
           gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
 
       - name: Remove a version's assets (action == remove)
@@ -129,10 +131,11 @@ jobs:
           source scripts/lib.sh
           svc="$(canonical_service "${{ inputs.service }}")"
           ver="${{ inputs.version }}"
+          # Sweep every possible os/arch combo. We don't publish macos-x86_64, but
+          # deleting it anyway is harmless (|| true) and cleans any legacy asset.
           for os in linux macos; do
             for arch in x86_64 aarch64; do
               name="$(artifact_filename "$svc" "$ver" "$os" "$arch")"
-              # Tolerate assets that never existed (e.g. a future macOS-less engine).
               gh release delete-asset "$RELEASE_TAG" "$name" --yes || true
             done
           done
