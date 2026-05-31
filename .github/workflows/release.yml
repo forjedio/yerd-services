@@ -1,0 +1,150 @@
+name: release
+
+# Build (or remove) ONE (service, version) and publish to the rolling `services`
+# release. Manually dispatched (or callable by an agent). See README.md.
+#
+# Atomic publish: build legs only emit per-platform GitHub Actions *artifacts*;
+# the single `finalize` job (which runs only when ALL legs succeed) downloads them
+# and uploads all four to the release together, then regenerates the listing. So a
+# partial build failure publishes NOTHING and leaves the live release untouched —
+# the listing always reflects reality.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: build (add/replace) or remove (delete) a (service, version)
+        type: choice
+        required: true
+        default: build
+        options: [build, remove]
+      service:
+        description: service id (valkey is the friendly alias for the redis slot)
+        type: choice
+        required: true
+        default: valkey
+        options: [valkey, redis, mysql, mariadb, postgres]
+      version:
+        description: the published label users install (e.g. 8, 8.4, 16)
+        type: string
+        required: true
+      upstream:
+        description: exact upstream source tag to build from (e.g. 9.1.0). Ignored for remove.
+        type: string
+        required: false
+        default: ""
+
+# Serialize whole runs so two dispatches can't race on index.html / services.json.
+concurrency:
+  group: services-release
+  cancel-in-progress: false
+
+# Publish to this repo's own releases; default token is enough (no PAT).
+permissions:
+  contents: write
+
+# Workflow-level env propagates to every job/step (incl. each matrix leg). GH_TOKEN
+# and GH_REPO are the canonical vars the gh CLI reads, so gh auth works everywhere.
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_REPO: ${{ github.repository }}
+  RELEASE_TAG: services
+
+jobs:
+  # Create the rolling release once if missing. Runs in parallel with build; finalize
+  # waits on it before touching the release.
+  ensure-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure the rolling release exists
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" \
+                 --title "yerd services" \
+                 --notes "Rolling release of yerd service binaries. Assets are managed by the release workflow; see index.html / services.json for the live listing."
+
+  build:
+    if: ${{ inputs.action == 'build' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    target: linux-x86_64 }
+          - { runner: ubuntu-24.04-arm, target: linux-aarch64 }
+          - { runner: macos-13,         target: macos-x86_64 }
+          - { runner: macos-14,         target: macos-aarch64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build artifact for ${{ matrix.target }}
+        run: |
+          scripts/build-service.sh "${{ inputs.service }}" "${{ inputs.version }}" "${{ inputs.upstream }}"
+      - name: Stage the one produced artifact for atomic publish
+        # Emit it as a workflow artifact rather than uploading to the release, so a
+        # partial-matrix failure never half-publishes to the live release.
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  finalize:
+    needs: [ensure-release, build]
+    # Run only when the release exists AND either every build leg succeeded (atomic
+    # publish) or this is a remove (build is skipped). A partial build failure ->
+    # build.result == 'failure' -> finalize skipped -> nothing was published.
+    if: >-
+      ${{ always()
+          && needs.ensure-release.result == 'success'
+          && (needs.build.result == 'success'
+              || (needs.build.result == 'skipped' && inputs.action == 'remove')) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all platform artifacts (action == build)
+        if: ${{ inputs.action == 'build' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifact-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish all platform binaries together (action == build)
+        if: ${{ inputs.action == 'build' }}
+        run: |
+          shopt -s nullglob
+          files=(dist/*.tar.gz)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "no artifacts downloaded to publish" >&2; exit 1
+          fi
+          # All four land before any listing change; --clobber replaces same-named assets.
+          gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
+
+      - name: Remove a version's assets (action == remove)
+        if: ${{ inputs.action == 'remove' }}
+        run: |
+          # Canonicalize so service=valkey addresses redis-* assets.
+          source scripts/lib.sh
+          svc="$(canonical_service "${{ inputs.service }}")"
+          ver="${{ inputs.version }}"
+          for os in linux macos; do
+            for arch in x86_64 aarch64; do
+              name="$(artifact_filename "$svc" "$ver" "$os" "$arch")"
+              # Tolerate assets that never existed (e.g. a future macOS-less engine).
+              gh release delete-asset "$RELEASE_TAG" "$name" --yes || true
+            done
+          done
+
+      - name: Regenerate listing + manifest from the live asset set
+        run: |
+          # One asset query; two derived files. Upload services.json first, then
+          # index.html LAST and alone so the daemon's critical listing has the
+          # smallest possible window of being mid-clobber.
+          gh release view "$RELEASE_TAG" --json assets -q '.assets[].name' \
+            | { grep '\.tar\.gz$' || true; } | LC_ALL=C sort > names.txt
+          scripts/gen-index.sh    < names.txt > index.html
+          scripts/gen-manifest.sh < names.txt > services.json
+          gh release upload "$RELEASE_TAG" services.json --clobber
+          gh release upload "$RELEASE_TAG" index.html   --clobber

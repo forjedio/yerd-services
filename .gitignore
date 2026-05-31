@@ -1,0 +1,10 @@
+# Build outputs (per-platform artifacts produced by scripts/build-service.sh)
+/dist/
+
+# Generated listing/manifest (published as release assets, never committed)
+/index.html
+/services.json
+/names.txt
+
+# macOS cruft
+.DS_Store
