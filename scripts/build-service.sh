@@ -82,9 +82,19 @@ case "$service" in
       # doesn't bundle (notably libaio; sometimes libnuma/libtinfo). Copy them into
       # lib/private/ so the artifact is self-contained on user machines, not just the CI
       # runner. Leave glibc core + libstdc++/libgcc to the host to avoid ABI mixing.
-      # NOTE: this can only copy what's installed on the BUILD host — the workflow
-      # apt-installs libaio etc. before building; the self-containment check below fails
-      # the build loudly if anything required wasn't bundled.
+      #
+      # We can only copy what's present on the BUILD host, and MySQL hard-links
+      # libaio.so.1 (and may link libnuma) — so self-provision the non-base deps on
+      # apt-based hosts (no-op if already present or not Debian/Ubuntu). Package names
+      # vary across Ubuntu releases, so try each. The self-containment gate below is the
+      # backstop if anything is still missing.
+      if command -v apt-get >/dev/null 2>&1 \
+         && ! ldconfig -p 2>/dev/null | grep -q 'libaio\.so\.1'; then
+        sudo apt-get update -qq 2>/dev/null || true
+        for p in libaio1t64 libaio1 libnuma1 libncurses6 libtinfo6; do
+          sudo apt-get install -y "$p" 2>/dev/null || true
+        done
+      fi
       mkdir -p "$stage/lib/private"
       while IFS= read -r dep; do
         cp -n "$dep" "$stage/lib/private/" 2>/dev/null || true
