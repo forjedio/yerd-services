@@ -80,15 +80,40 @@ case "$service" in
     elif [[ "$OS" == linux ]]; then
       # The Linux generic tarball dynamically links a few non-glibc system libs it
       # doesn't bundle (notably libaio; sometimes libnuma/libtinfo). Copy them into
-      # lib/private/ (already on mysqld's $ORIGIN rpath) so the artifact is
-      # self-contained on user machines, not just the CI runner. Leave glibc core +
-      # libstdc++/libgcc to the host to avoid ABI mixing.
+      # lib/private/ so the artifact is self-contained on user machines, not just the CI
+      # runner. Leave glibc core + libstdc++/libgcc to the host to avoid ABI mixing.
+      # NOTE: this can only copy what's installed on the BUILD host — the workflow
+      # apt-installs libaio etc. before building; the self-containment check below fails
+      # the build loudly if anything required wasn't bundled.
       mkdir -p "$stage/lib/private"
       while IFS= read -r dep; do
         cp -n "$dep" "$stage/lib/private/" 2>/dev/null || true
       done < <(ldd "$stage/bin/mysqld" "$stage/bin/mysql" 2>/dev/null \
         | awk '/=> \// && !/libc\.so|libm\.so|libpthread|libdl\.so|librt\.so|libresolv|ld-linux|linux-vdso|libstdc\+\+|libgcc_s/ {print $3}' \
         | sort -u)
+      # Don't trust Oracle's baked rpath to cover lib/private — add it explicitly.
+      if command -v patchelf >/dev/null 2>&1; then
+        for b in "$stage/bin/mysqld" "$stage/bin/mysql"; do
+          patchelf --add-rpath '$ORIGIN/../lib/private' "$b" 2>/dev/null || true
+          patchelf --add-rpath '$ORIGIN/../lib' "$b" 2>/dev/null || true
+        done
+      fi
+      # Self-containment gate: every non-glibc/non-libstdc++ NEEDED lib of mysqld must be
+      # bundled under lib/, else the artifact runs on the CI host (which has the system
+      # lib) but breaks on a user machine — exactly the libaio.so.1 failure mode. Fail
+      # the build with a clear message instead of shipping it.
+      if command -v patchelf >/dev/null 2>&1; then
+        core='^(libc|libm|libmvec|libpthread|libdl|librt|libresolv|libstdc\+\+|libgcc_s|ld-linux.*)\.so'
+        while IFS= read -r need; do
+          [[ -z "$need" ]] && continue
+          echo "$need" | grep -Eq "$core" && continue
+          find "$stage/lib" -name "$need" | grep -q . || {
+            echo "mysql(linux): required lib '$need' is not bundled. Install it on the" >&2
+            echo "  build host before building (e.g. 'apt-get install -y libaio1t64')." >&2
+            exit 1
+          }
+        done < <(patchelf --print-needed "$stage/bin/mysqld" 2>/dev/null)
+      fi
     fi
     require_files "$stage" bin/mysqld bin/mysql bin/mysqld_safe
     ;;
