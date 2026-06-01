@@ -169,10 +169,15 @@ case "$service" in
       # auto-linking brew GnuTLS (a huge p11-kit/nettle tree that's painful to bundle).
       ssl_args=(-DWITH_SSL=system -DCMAKE_DISABLE_FIND_PACKAGE_GnuTLS=ON)
       [[ "$OS" == macos ]] && ssl_args+=(-DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3 2>/dev/null)")
+      # Force BUNDLED pcre/zlib/fmt instead of auto-finding the host's (Homebrew) copies. On a
+      # loaded runner `auto` finds brew pcre2/fmt and injects /opt/homebrew/include globally,
+      # which breaks libc++'s header search ("<cstddef> ... didn't find <stddef.h>"). Bundling
+      # makes the build hermetic across machines (and compiles those libs in — more relocatable).
       cmake -S "$work/src" -B "$work/bld" \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$work/mi" \
         -DWITH_UNIT_TESTS=0 -DWITH_MARIABACKUP=0 -DWITH_EMBEDDED_SERVER=OFF \
         -DPLUGIN_PERFSCHEMA=NO "${ssl_args[@]}" \
+        -DWITH_PCRE=bundled -DWITH_ZLIB=bundled -DWITH_LIBFMT=bundled \
         -DPLUGIN_CONNECT=NO -DPLUGIN_MROONGA=NO -DPLUGIN_ROCKSDB=NO -DPLUGIN_SPIDER=NO \
         -DPLUGIN_COLUMNSTORE=NO -DPLUGIN_OQGRAPH=NO -DPLUGIN_SPHINX=NO -DPLUGIN_S3=NO
       cmake --build "$work/bld" -j"$jobs"
