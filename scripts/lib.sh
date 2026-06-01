@@ -100,3 +100,114 @@ pack_stage() {
     tar -czf "$out" -C "$stage_dir" .
   fi
 }
+
+# --- macOS relocatability --------------------------------------------------------
+
+# macos_make_relocatable <stage>: make every Mach-O under <stage> self-contained and
+# runnable from an arbitrary dir. Vendors/builds on macOS often bake absolute dylib
+# paths (Postgres: $prefix/lib/libpq…) or bare @loader_path/<lib> sibling refs that
+# actually live in lib/ (Oracle MySQL: libprotobuf-lite). For each Mach-O we:
+#   - add an LC_RPATH so @rpath resolves to <stage>/lib from that file's location,
+#   - set each dylib's own id to @rpath/<name>,
+#   - rewrite non-system absolute deps and bad @loader_path sibling deps to @rpath/<name>,
+#   - re-sign ad-hoc (install_name_tool invalidates the signature; arm64 won't run an
+#     invalidly-signed binary).
+# No-op on Linux (handled there by the $ORIGIN rpath the linker bakes in).
+macos_make_relocatable() {
+  local stage="$1" f base dep rest reldir
+  [[ "$(host_os)" == macos ]] || return 0
+  while IFS= read -r f; do
+    file -b "$f" | grep -q 'Mach-O' || continue
+    reldir="$(python3 -c 'import os,sys;print(os.path.relpath(sys.argv[1],sys.argv[2]))' \
+              "$stage/lib" "$(dirname "$f")")"
+    install_name_tool -add_rpath "@loader_path/$reldir" "$f" 2>/dev/null || true
+    if file -b "$f" | grep -q 'shared library'; then
+      install_name_tool -id "@rpath/$(basename "$f")" "$f" 2>/dev/null || true
+    fi
+    while IFS= read -r dep; do
+      base="${dep##*/}"
+      case "$dep" in
+        /usr/lib/*|/System/*|@rpath/*|@executable_path/*) : ;;
+        /*) install_name_tool -change "$dep" "@rpath/$base" "$f" 2>/dev/null || true ;;
+        @loader_path/*)
+          rest="${dep#@loader_path/}"
+          [[ "$rest" == */* ]] && continue            # already a path (../lib/…), leave it
+          if [[ -e "$stage/lib/$rest" && ! -e "$(dirname "$f")/$rest" ]]; then
+            install_name_tool -change "$dep" "@rpath/$base" "$f" 2>/dev/null || true
+          fi
+          ;;
+      esac
+    done < <(otool -L "$f" | tail -n +2 | awk '{print $1}')
+    codesign --force --sign - "$f" 2>/dev/null || true
+  done < <(find "$stage" -type f)
+}
+
+# linux_make_relocatable <stage>: set an $ORIGIN-relative RUNPATH on every ELF under
+# <stage> so binaries find bundled libs after the tree is moved. Postgres' Linux build
+# bakes an ABSOLUTE rpath to its build libdir, so a relocated initdb/psql can't find
+# libpq.so without this. Requires patchelf. No-op on macOS (handled by install names).
+# (MySQL's Linux generic tarball is already $ORIGIN-relative, so it doesn't need this.)
+linux_make_relocatable() {
+  local stage="$1" f
+  [[ "$(host_os)" == linux ]] || return 0
+  command -v patchelf >/dev/null 2>&1 || { echo "linux_make_relocatable: patchelf not found" >&2; return 1; }
+  while IFS= read -r f; do
+    file -b "$f" 2>/dev/null | grep -q '^ELF' || continue
+    # Generous multi-entry rpath covering every file location: bin/ (-> ../lib), libs in
+    # lib/ ($ORIGIN), and nested lib/postgresql/*.so reaching lib/ ($ORIGIN/..).
+    patchelf --set-rpath '$ORIGIN:$ORIGIN/..:$ORIGIN/../lib:$ORIGIN/../lib/postgresql' "$f" 2>/dev/null || true
+  done < <(find "$stage/bin" "$stage/lib" -type f 2>/dev/null)
+}
+
+# --- downloads -------------------------------------------------------------------
+
+# fetch_to <url> <out>: download url to out with retries. Fails loudly on HTTP errors.
+fetch_to() {
+  local url="$1" out="$2"
+  curl -fsSL --retry 3 --retry-delay 2 -o "$out" "$url"
+}
+
+# _url_ok <url>: true if the URL resolves to a 2xx (follows redirects, HEAD only).
+_url_ok() {
+  curl -fsIL -o /dev/null "$1"
+}
+
+# mysql_generic_url <upstream> <os> <arch>: echo the resolved download URL for the
+# Oracle MySQL generic binary tarball matching the host platform, or fail loudly.
+#
+# Filenames (verified against cdn.mysql.com):
+#   linux: mysql-<up>-linux-glibc2.28-<x86_64|aarch64>.tar.xz
+#   macos: mysql-<up>-macos<NN>-arm64.tar.gz   (macOS uses 'arm64', our token is 'aarch64';
+#          the macos<NN> build-OS tag changes per release, so probe NN in {15,14,13})
+# Base dir is MySQL-<maj.min> (e.g. MySQL-8.4); cdn.mysql.com first, dev.mysql.com mirror.
+mysql_generic_url() {
+  local up="$1" os="$2" arch="$3"
+  local majmin file
+  majmin="$(printf '%s\n' "$up" | cut -d. -f1,2)"
+
+  local -a files=()
+  case "$os" in
+    linux)
+      files=("mysql-${up}-linux-glibc2.28-${arch}.tar.xz")
+      ;;
+    macos)
+      # we only build macOS on arm64
+      local nn
+      for nn in 15 14 13; do
+        files+=("mysql-${up}-macos${nn}-arm64.tar.gz")
+      done
+      ;;
+    *) echo "mysql_generic_url: unsupported os '$os'" >&2; return 1 ;;
+  esac
+
+  local f base url
+  for f in "${files[@]}"; do
+    for base in "https://cdn.mysql.com/Downloads/MySQL-${majmin}" \
+                "https://dev.mysql.com/get/Downloads/MySQL-${majmin}"; do
+      url="$base/$f"
+      if _url_ok "$url"; then echo "$url"; return 0; fi
+    done
+  done
+  echo "mysql_generic_url: no MySQL generic tarball found for $up $os $arch" >&2
+  return 1
+}

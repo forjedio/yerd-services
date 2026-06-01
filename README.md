@@ -23,8 +23,8 @@ It is intentionally **isolated** from the main app:
 | service    | slot filled by | phase | state |
 |------------|----------------|-------|-------|
 | `redis`    | **Valkey** (BSD-3) | 1 | ✅ implemented (build from source) |
-| `mysql`    | Oracle MySQL (GPLv2) | 2 | ⏳ stub |
-| `postgres` | PostgreSQL (PostgreSQL License) | 2 | ⏳ stub |
+| `mysql`    | Oracle MySQL (GPLv2) | 2 | ✅ implemented (repackage generic tarball) |
+| `postgres` | PostgreSQL (PostgreSQL License) | 2 | ✅ implemented (build from source) |
 | `mariadb`  | MariaDB (GPLv2) | 3 | ⏳ stub |
 
 The `redis` slot ships **[Valkey](https://github.com/valkey-io/valkey)** (Linux Foundation,
@@ -37,22 +37,23 @@ is always named `redis-…`.
 Both are one `gh workflow run` (or the Actions **Run workflow** button, or an agent):
 
 ```sh
-# Release a NEW version — e.g. Valkey 8.1 lands upstream:
+# Release a NEW version — e.g. Valkey 9.1 lands upstream:
 gh workflow run release.yml \
-  -f action=build -f service=valkey -f version=8.1 -f upstream=8.1.0
-#  → builds all platforms, uploads redis-8.1-*.tar.gz, refreshes index.html + services.json.
-#    Everything else (redis 8, mysql, …) is untouched.
+  -f action=build -f service=valkey -f version=9.1 -f upstream=9.1.0
+#  → builds all platforms, uploads redis-9.1-*.tar.gz, refreshes index.html + services.json.
+#    Everything else (redis 9.0, mysql, …) is untouched.
 
-# EXCLUDE a bad version — e.g. pull Valkey 8.0:
+# EXCLUDE a bad version — e.g. pull Valkey 9.0:
 gh workflow run release.yml \
-  -f action=remove -f service=valkey -f version=8.0
-#  → deletes redis-8.0-*.tar.gz, refreshes index.html + services.json so 8.0 disappears.
+  -f action=remove -f service=valkey -f version=9.0
+#  → deletes redis-9.0-*.tar.gz, refreshes index.html + services.json so 9.0 disappears.
 #    (upstream is ignored for remove.) Copies already installed on user disks keep working.
 ```
 
-- `version` is the **label** users type (`8`, `8.4`); `upstream` is the **exact source tag**
-  to build (`8.4.0`). A label like `8` can be repointed to a newer upstream by rebuilding with
-  the same `version` and a new `upstream` (the asset is replaced via `--clobber`).
+- `version` is the **label** users type (`9`, `9.1`); `upstream` is the **exact source tag**
+  to build (`9.1.0`). Keep the label meaningful — match it to the upstream major/minor (don't
+  label a 9.x build `8`). A label like `9` can be repointed to a newer upstream by rebuilding
+  with the same `version` and a new `upstream` (the asset is replaced via `--clobber`).
 - Removal deletes a version's assets and refreshes the listing; it does not reach back to
   already-installed copies.
 
@@ -120,13 +121,19 @@ the escape hatch is to move `SERVICES_BASE_URL` to a CDN while keeping this arti
 
 ## Provenance
 
-| service | version | upstream project | exact tag | build flags |
-|---------|---------|------------------|-----------|-------------|
-| `redis` | _(label)_ | [Valkey](https://github.com/valkey-io/valkey) | _`<upstream>` per dispatch_ | `make -j BUILD_TLS=no` |
+| service | version | upstream source | how | notes |
+|---------|---------|-----------------|-----|-------|
+| `redis` | _(label)_ | [Valkey](https://github.com/valkey-io/valkey) tag `<upstream>` | build from source | `make -j BUILD_TLS=no` |
+| `mysql` | _(label)_ | [Oracle MySQL](https://dev.mysql.com/downloads/mysql/) generic tarball `<upstream>` (e.g. 8.4.9 LTS) | repackage | `bin/{mysqld,mysql,mysqld_safe}` + bundled `lib/`+`share/`; macOS dylib install-names made relocatable |
+| `postgres` | _(label)_ | [postgresql.org](https://ftp.postgresql.org/pub/source/) source `<upstream>` (e.g. 17.10) | build from source | `./configure --without-icu --without-readline --without-zlib --without-libxml` (no compressed `pg_dump`); macOS made relocatable |
+
+Each `(service, version)` is built per dispatch; the `<upstream>` actually used is whatever
+you pass. Every published artifact is **smoke-tested** on its native platform (start the
+server, run `SELECT 1`/`PING`) before it's allowed onto the release.
 
 Surface names with trademark care in the UI: **"Redis (Valkey)"** (BSD-3),
-"MySQL (Oracle)" / MariaDB (GPLv2, preserve notices), PostgreSQL (permissive). Upstream
-license texts live in [`LICENSES/`](LICENSES/).
+**"MySQL (Oracle)"** (GPLv2, preserve notices) / MariaDB (GPLv2), PostgreSQL (permissive).
+Upstream license texts live in [`LICENSES/`](LICENSES/).
 
 ## Repo layout
 
@@ -134,14 +141,17 @@ license texts live in [`LICENSES/`](LICENSES/).
 yerd-services/
 ├── README.md
 ├── LICENSES/                       # upstream license texts (BSD/GPL/PostgreSQL)
-│   └── valkey-BSD-3-Clause.txt
+│   ├── valkey-BSD-3-Clause.txt
+│   ├── mysql-GPLv2.txt
+│   └── postgresql-PostgreSQL-License.txt
 ├── scripts/
-│   ├── lib.sh                      # os/arch tokens, canonical_service, artifact_filename, pack_stage, …
+│   ├── lib.sh                      # os/arch tokens, canonical_service, artifact_filename, pack_stage, macos_make_relocatable, …
 │   ├── build-service.sh            # build/repackage ONE (service,version,upstream) for the host platform
+│   ├── smoke-test.sh               # extract a built artifact + run the server (SELECT 1 / PING) — each build leg, pre-publish
 │   ├── gen-index.sh                # *.tar.gz names (stdin) → index.html (daemon's listing)
 │   └── gen-manifest.sh             # *.tar.gz names (stdin) → services.json (additive)
 └── .github/workflows/
-    └── release.yml                 # workflow_dispatch: ensure-release → build matrix → finalize
+    └── release.yml                 # workflow_dispatch: ensure-release → build (build+smoke) → finalize
 ```
 
 ## Platform matrix

@@ -55,17 +55,79 @@ case "$service" in
     ;;
 
   mysql)
-    # Phase 2: repackage Oracle's generic binary tarballs ->
-    # bin/{mysqld,mysql,mysqld_safe} (+ required lib/). Not yet implemented.
-    echo "build-service.sh: mysql not yet implemented (Phase 2)" >&2
-    exit 1
+    # Phase 2: repackage Oracle's generic binary tarballs (GPLv2, redistributable).
+    # All 3 targets have generic builds; mysqld is relocatable (derives basedir from
+    # the binary path, bundled libs load via @loader_path/$ORIGIN).
+    url="$(mysql_generic_url "$upstream" "$OS" "$ARCH")"
+    echo ">> mysql source: $url"
+    fetch_to "$url" "$work/mysql.tar"
+    mkdir -p "$work/m"
+    # tar xf auto-detects gz/xz (macOS=.tar.gz, linux=.tar.xz); --strip-components 1
+    # drops the leading mysql-<...>/ dir.
+    tar xf "$work/mysql.tar" -C "$work/m" --strip-components 1
+    cp "$work/m/bin/mysqld" "$work/m/bin/mysql" "$work/m/bin/mysqld_safe" "$stage/bin/"
+    # Ship lib/ and share/ WHOLESALE (no cherry-pick): mysqld needs errmsg.sys +
+    # charsets under share/, plugins under lib/, and --initialize-insecure may consult
+    # more. Trimming is a deferred optimization, guarded by the smoke test.
+    cp -R "$work/m/lib" "$stage/lib"
+    cp -R "$work/m/share" "$stage/share"
+    # Guard against an empty bundle (a dead artifact only the smoke test would catch).
+    [[ -d "$stage/lib" ]] || { echo "mysql: staged lib/ missing" >&2; exit 1; }
+    if [[ "$OS" == macos ]]; then
+      [[ -n "$(find "$stage/lib" -name '*.dylib' -print -quit)" ]] \
+        || { echo "mysql(macos): no bundled .dylib under lib/" >&2; exit 1; }
+      macos_make_relocatable "$stage"
+    elif [[ "$OS" == linux ]]; then
+      # The Linux generic tarball dynamically links a few non-glibc system libs it
+      # doesn't bundle (notably libaio; sometimes libnuma/libtinfo). Copy them into
+      # lib/private/ (already on mysqld's $ORIGIN rpath) so the artifact is
+      # self-contained on user machines, not just the CI runner. Leave glibc core +
+      # libstdc++/libgcc to the host to avoid ABI mixing.
+      mkdir -p "$stage/lib/private"
+      while IFS= read -r dep; do
+        cp -n "$dep" "$stage/lib/private/" 2>/dev/null || true
+      done < <(ldd "$stage/bin/mysqld" "$stage/bin/mysql" 2>/dev/null \
+        | awk '/=> \// && !/libc\.so|libm\.so|libpthread|libdl\.so|librt\.so|libresolv|ld-linux|linux-vdso|libstdc\+\+|libgcc_s/ {print $3}' \
+        | sort -u)
+    fi
+    require_files "$stage" bin/mysqld bin/mysql bin/mysqld_safe
     ;;
 
   postgres)
-    # Phase 2: repackage a full EDB build with
-    # bin/{postgres,initdb,pg_ctl,psql,createdb}. Not yet implemented.
-    echo "build-service.sh: postgres not yet implemented (Phase 2)" >&2
-    exit 1
+    # Phase 2: build from source (EDB ships no ARM binaries; zonky's ARM builds lack
+    # psql/createdb). Release tarball bundles pre-generated gram.c/scan.c -> no
+    # flex/bison/perl needed; just cc + make. PostgreSQL License (permissive).
+    fetch_to "https://ftp.postgresql.org/pub/source/v${upstream}/postgresql-${upstream}.tar.gz" \
+      "$work/pg.tar.gz"
+    mkdir -p "$work/pg"
+    tar xf "$work/pg.tar.gz" -C "$work/pg" --strip-components 1
+    jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+    # Lean + relocatable. SSL is off by default (no --without-ssl flag exists). Loopback
+    # 'trust' auth at runtime means no TLS needed.
+    ( cd "$work/pg" && ./configure --prefix="$work/pgi" \
+        --without-icu --without-readline --without-zlib --without-libxml )
+    make -C "$work/pg" -j"$jobs"
+    make -C "$work/pg" install
+    cp "$work/pgi/bin/postgres" "$work/pgi/bin/initdb" "$work/pgi/bin/pg_ctl" \
+       "$work/pgi/bin/psql" "$work/pgi/bin/createdb" "$stage/bin/"
+    # Postgres resolves share/ + lib/ relative to the executable, so ship them verbatim.
+    cp -R "$work/pgi/lib" "$stage/lib"
+    cp -R "$work/pgi/share" "$stage/share"
+    # initdb needs the timezone db + bootstrap catalog + sample configs. The source
+    # build nests these under share/postgresql/ (and lib/postgresql/); postgres resolves
+    # them via the compiled-in bin -> ../share/postgresql relative path, so the verbatim
+    # copy keeps it relocatable.
+    [[ -d "$stage/share/postgresql/timezone" ]] || { echo "postgres: share/postgresql/timezone missing" >&2; exit 1; }
+    [[ -f "$stage/share/postgresql/postgres.bki" ]] || { echo "postgres: share/postgresql/postgres.bki missing" >&2; exit 1; }
+    ls "$stage"/share/postgresql/*.sample >/dev/null 2>&1 \
+      || { echo "postgres: no *.sample configs in share/postgresql/" >&2; exit 1; }
+    # PG bakes absolute lib paths into the binaries (macOS install names / Linux rpath);
+    # rewrite them relative to the executable so the unpacked tree relocates.
+    case "$OS" in
+      macos) macos_make_relocatable "$stage" ;;
+      linux) linux_make_relocatable "$stage" ;;
+    esac
+    require_files "$stage" bin/postgres bin/initdb bin/pg_ctl bin/psql bin/createdb
     ;;
 
   mariadb)
@@ -80,6 +142,20 @@ case "$service" in
     exit 1
     ;;
 esac
+
+# Ship the upstream license inside the artifact (required for GPLv2 redistribution of
+# MySQL — which we additionally modify via install_name_tool/codesign on macOS — and
+# good practice for the others).
+case "$service" in
+  redis)    lic=valkey-BSD-3-Clause.txt ;;
+  mysql)    lic=mysql-GPLv2.txt ;;
+  postgres) lic=postgresql-PostgreSQL-License.txt ;;
+  *)        lic="" ;;
+esac
+if [[ -n "$lic" ]]; then
+  [[ -f "$repo_root/LICENSES/$lic" ]] || { echo "missing LICENSES/$lic" >&2; exit 1; }
+  cp "$repo_root/LICENSES/$lic" "$stage/LICENSE"
+fi
 
 pack_stage "$stage" "$out"
 echo ">> wrote $out"
