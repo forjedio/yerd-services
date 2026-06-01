@@ -25,7 +25,7 @@ It is intentionally **isolated** from the main app:
 | `redis`    | **Valkey** (BSD-3) | 1 | ✅ implemented (build from source) |
 | `mysql`    | Oracle MySQL (GPLv2) | 2 | ✅ implemented (repackage generic tarball) |
 | `postgres` | PostgreSQL (PostgreSQL License) | 2 | ✅ implemented (build from source) |
-| `mariadb`  | MariaDB (GPLv2) | 3 | ⏳ stub |
+| `mariadb`  | MariaDB (GPLv2) | 3 | ✅ implemented (repackage x86_64 + build from source for ARM/macOS) |
 
 The `redis` slot ships **[Valkey](https://github.com/valkey-io/valkey)** (Linux Foundation,
 BSD-3, wire-compatible) because Redis 7.4+ is SSPL/RSALv2 (redistribution-restricted).
@@ -40,13 +40,13 @@ Both are one `gh workflow run` (or the Actions **Run workflow** button, or an ag
 # Release a NEW version — e.g. Valkey 9.1 lands upstream:
 gh workflow run release.yml \
   -f action=build -f service=valkey -f version=9.1 -f upstream=9.1.0
-#  → builds all platforms, uploads redis-9.1-*.tar.gz, refreshes index.html + services.json.
+#  → builds all platforms, uploads redis-9.1-*.tar.gz, refreshes services.json.
 #    Everything else (redis 9.0, mysql, …) is untouched.
 
 # EXCLUDE a bad version — e.g. pull Valkey 9.0:
 gh workflow run release.yml \
   -f action=remove -f service=valkey -f version=9.0
-#  → deletes redis-9.0-*.tar.gz, refreshes index.html + services.json so 9.0 disappears.
+#  → deletes redis-9.0-*.tar.gz, refreshes services.json so 9.0 disappears.
 #    (upstream is ignored for remove.) Copies already installed on user disks keep working.
 ```
 
@@ -81,25 +81,10 @@ and points data/socket/port at user paths via config, never compiled-in defaults
 | `mariadb`  | `mariadbd` | `mariadb`, `mariadb-install-db` |
 | `postgres` | `postgres` | `initdb`, `pg_ctl`, `psql`, `createdb` |
 
-**Listing (`index.html`):** GitHub Releases has no directory autoindex, so the workflow
-publishes a generated `index.html` (one `<a href>` per artifact) as a release asset. The
-daemon fetches it as the listing. Always regenerated from the release's live asset set.
-
-**URLs the consumer hard-codes:**
-```
-SERVICES_BASE_URL = https://github.com/forjedio/yerd-services/releases/download/services
-listing           = {SERVICES_BASE_URL}/index.html
-artifact          = {SERVICES_BASE_URL}/<filename>
-```
-Integrity is TLS-only today (no checksum pinning), matching the PHP path.
-
-### `services.json` (additive — not part of the frozen contract)
-
-Alongside `index.html` the workflow also publishes a machine-readable
-[`services.json`](https://github.com/forjedio/yerd-services/releases/download/services/services.json)
-for agents/tooling to parse the available versions. It is derived from the same live asset
-set, so it can't drift. **The daemon still parses `index.html`** — `services.json` is purely
-additive and nothing in `forjedio/yerd` depends on it.
+**Listing (`services.json`):** GitHub Releases has no directory autoindex, so the workflow
+publishes a generated `services.json` manifest as a release asset; the daemon fetches it to
+discover what's installable. It is derived purely from the release's live `*.tar.gz` assets,
+so it can't drift, and is regenerated after every build/remove.
 
 ```json
 { "schema": 1,
@@ -108,6 +93,18 @@ additive and nothing in `forjedio/yerd` depends on it.
       { "version": "8", "platforms": ["linux-aarch64","linux-x86_64","macos-aarch64"] }
     ] } } }
 ```
+
+It carries only what the filenames encode (service, version, platforms); provenance/build
+flags live in this README. (A legacy `index.html` listing was dropped in favour of this
+manifest; the workflow deletes any leftover `index.html` asset.)
+
+**URLs the consumer hard-codes:**
+```
+SERVICES_BASE_URL = https://github.com/forjedio/yerd-services/releases/download/services
+listing           = {SERVICES_BASE_URL}/services.json
+artifact          = {SERVICES_BASE_URL}/<filename>
+```
+Integrity is TLS-only today (no checksum pinning), matching the PHP path.
 
 ## Hosting model
 
@@ -126,6 +123,7 @@ the escape hatch is to move `SERVICES_BASE_URL` to a CDN while keeping this arti
 | `redis` | _(label)_ | [Valkey](https://github.com/valkey-io/valkey) tag `<upstream>` | build from source | `make -j BUILD_TLS=no` |
 | `mysql` | _(label)_ | [Oracle MySQL](https://dev.mysql.com/downloads/mysql/) generic tarball `<upstream>` (e.g. 8.4.9 LTS) | repackage | `bin/{mysqld,mysql,mysqld_safe}` + bundled `lib/`+`share/`; macOS dylib install-names made relocatable |
 | `postgres` | _(label)_ | [postgresql.org](https://ftp.postgresql.org/pub/source/) source `<upstream>` (e.g. 17.10) | build from source | `./configure --without-icu --without-readline --without-zlib --without-libxml` (no compressed `pg_dump`); macOS made relocatable |
+| `mariadb` | _(label)_ | [archive.mariadb.org](https://archive.mariadb.org/) `<upstream>` (e.g. 11.8.8 LTS) | repackage (linux-x86_64) / build from source (ARM Linux + macOS) | MariaDB ships only a `linux-systemd-x86_64` bintar; CMake build for the rest (`-DWITH_SSL=system`, heavy plugins trimmed). `bin/{mariadbd,mariadb,mariadb-install-db,my_print_defaults,…}` + `lib/`+`share/`; made relocatable + self-contained |
 
 Each `(service, version)` is built per dispatch; the `<upstream>` actually used is whatever
 you pass. Every published artifact is **smoke-tested** on its native platform (start the
@@ -143,13 +141,13 @@ yerd-services/
 ├── LICENSES/                       # upstream license texts (BSD/GPL/PostgreSQL)
 │   ├── valkey-BSD-3-Clause.txt
 │   ├── mysql-GPLv2.txt
-│   └── postgresql-PostgreSQL-License.txt
+│   ├── postgresql-PostgreSQL-License.txt
+│   └── mariadb-GPLv2.txt
 ├── scripts/
 │   ├── lib.sh                      # os/arch tokens, canonical_service, artifact_filename, pack_stage, macos_make_relocatable, …
 │   ├── build-service.sh            # build/repackage ONE (service,version,upstream) for the host platform
 │   ├── smoke-test.sh               # extract a built artifact + run the server (SELECT 1 / PING) — each build leg, pre-publish
-│   ├── gen-index.sh                # *.tar.gz names (stdin) → index.html (daemon's listing)
-│   └── gen-manifest.sh             # *.tar.gz names (stdin) → services.json (additive)
+│   └── gen-manifest.sh             # *.tar.gz names (stdin) → services.json (the daemon's listing)
 └── .github/workflows/
     └── release.yml                 # workflow_dispatch: ensure-release → build (build+smoke) → finalize
 ```

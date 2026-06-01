@@ -142,6 +142,62 @@ macos_make_relocatable() {
   done < <(find "$stage" -type f)
 }
 
+# macos_bundle_external <stage>: copy external (Homebrew/MacPorts) dylib dependencies of the
+# staged Mach-O files INTO <stage>/lib so the tree is self-contained, looping to pick up
+# transitive external deps. Run BEFORE macos_make_relocatable (which then rewrites the
+# now-local refs to @rpath). The macOS analogue of linux_self_contain's ldd sweep. No-op off
+# macOS. (Libs that reference siblings via @loader_path are fine here because the binaries link
+# both directly, so both get copied.)
+macos_bundle_external() {
+  local stage="$1" f dep base changed=1
+  [[ "$(host_os)" == macos ]] || return 0
+  mkdir -p "$stage/lib"
+  while [[ "$changed" -eq 1 ]]; do
+    changed=0
+    while IFS= read -r f; do
+      file -b "$f" 2>/dev/null | grep -q 'Mach-O' || continue
+      while IFS= read -r dep; do
+        case "$dep" in
+          /opt/homebrew/*|/usr/local/Cellar/*|/usr/local/opt/*|/opt/local/*)
+            base="${dep##*/}"
+            if [[ ! -e "$stage/lib/$base" ]]; then
+              cp -L "$dep" "$stage/lib/$base" 2>/dev/null \
+                && { chmod u+w "$stage/lib/$base" 2>/dev/null; changed=1; }
+            fi
+            ;;
+        esac
+      done < <(otool -L "$f" | tail -n +2 | awk '{print $1}')
+    done < <(find "$stage" -type f)
+  done
+}
+
+# macos_self_contain_gate <stage>: fail if any staged Mach-O has a dependency that won't
+# resolve on a clean Mac — an @rpath/@loader_path/@executable_path/<lib> with no matching file
+# under <stage>, or an absolute path under a package-manager prefix (/opt/homebrew, /usr/local,
+# /opt/local). System libs (/usr/lib, /System) are allowed. Catches the
+# "rewritten-to-@rpath-but-never-bundled" dylib that a brew-equipped build machine's smoke test
+# wouldn't surface. No-op off macOS.
+macos_self_contain_gate() {
+  local stage="$1" f dep base
+  [[ "$(host_os)" == macos ]] || return 0
+  while IFS= read -r f; do
+    file -b "$f" 2>/dev/null | grep -q 'Mach-O' || continue
+    while IFS= read -r dep; do
+      case "$dep" in
+        /usr/lib/*|/System/*) : ;;
+        /opt/homebrew/*|/usr/local/*|/opt/local/*)
+          echo "macos_self_contain_gate: ${f#"$stage"/} depends on unbundled '$dep'" >&2; return 1 ;;
+        @rpath/*|@loader_path/*|@executable_path/*)
+          base="${dep##*/}"
+          [[ -n "$(find "$stage" -name "$base" -print -quit 2>/dev/null)" ]] || {
+            echo "macos_self_contain_gate: ${f#"$stage"/} has dangling '$dep' (not bundled)" >&2; return 1; }
+          ;;
+        /*) echo "macos_self_contain_gate: ${f#"$stage"/} depends on non-system abs path '$dep'" >&2; return 1 ;;
+      esac
+    done < <(otool -L "$f" | tail -n +2 | awk '{print $1}')
+  done < <(find "$stage" -type f)
+}
+
 # linux_make_relocatable <stage>: set an $ORIGIN-relative RUNPATH on every ELF under
 # <stage> so binaries find bundled libs after the tree is moved. Postgres' Linux build
 # bakes an ABSOLUTE rpath to its build libdir, so a relocated initdb/psql can't find
@@ -157,6 +213,63 @@ linux_make_relocatable() {
     # lib/ ($ORIGIN), and nested lib/postgresql/*.so reaching lib/ ($ORIGIN/..).
     patchelf --set-rpath '$ORIGIN:$ORIGIN/..:$ORIGIN/../lib:$ORIGIN/../lib/postgresql' "$f" 2>/dev/null || true
   done < <(find "$stage/bin" "$stage/lib" -type f 2>/dev/null)
+}
+
+# linux_self_contain <stage> <bin-relpath...>: make the listed Linux ELF executables run from
+# an arbitrary location with NO dependency on the build host's system libs. For each binary:
+# sweep its non-core shared-lib deps into <stage>/lib/private, ensure libaio, strip symbols,
+# add an $ORIGIN-relative rpath, then GATE that every non-core NEEDED lib is actually bundled
+# (fail loudly otherwise — else it runs on the CI host but breaks on a clean user machine).
+# Shared by mysql (repackage) and mariadb (both Linux paths). No-op on macOS.
+linux_self_contain() {
+  local stage="$1"; shift
+  [[ "$(host_os)" == linux ]] || return 0
+  ensure_patchelf || true
+  mkdir -p "$stage/lib/private"
+  local b bins=()
+  for b in "$@"; do bins+=("$stage/$b"); done
+
+  # 1) bundle non-core deps (leave glibc core + libstdc++/libgcc to the host — ABI safety)
+  local dep
+  while IFS= read -r dep; do
+    cp -n "$dep" "$stage/lib/private/" 2>/dev/null || true
+  done < <(ldd "${bins[@]}" 2>/dev/null \
+    | awk '/=> \// && !/libc\.so|libm\.so|libmvec|libpthread|libdl\.so|librt\.so|libresolv|ld-linux|linux-vdso|libstdc\+\+|libgcc_s/ {print $3}' \
+    | sort -u)
+
+  # 2) libaio.so.1 (hard-required by mysql/mariadb; time64-renamed on Ubuntu 24.04)
+  ensure_libaio "$stage/lib/private" \
+    || echo "linux_self_contain: could not provision libaio (gate will report)" >&2
+
+  # 3) strip symbols (size) from the binaries + bundled .so
+  strip "${bins[@]}" 2>/dev/null || true
+  find "$stage/lib" -type f \( -name '*.so' -o -name '*.so.*' \) \
+    -exec strip --strip-unneeded {} + 2>/dev/null || true
+
+  # 4) rpath so the binaries find lib/private + lib regardless of any baked rpath
+  if command -v patchelf >/dev/null 2>&1; then
+    for b in "${bins[@]}"; do
+      patchelf --add-rpath '$ORIGIN/../lib/private' "$b" 2>/dev/null || true
+      patchelf --add-rpath '$ORIGIN/../lib' "$b" 2>/dev/null || true
+    done
+  fi
+
+  # 5) self-containment gate over each binary
+  if command -v patchelf >/dev/null 2>&1; then
+    local core='^(libc|libm|libmvec|libpthread|libdl|librt|libresolv|libstdc\+\+|libgcc_s|ld-linux.*)\.so'
+    local need
+    for b in "${bins[@]}"; do
+      while IFS= read -r need; do
+        [[ -z "$need" ]] && continue
+        echo "$need" | grep -Eq "$core" && continue
+        find "$stage/lib" -name "$need" | grep -q . || {
+          echo "linux_self_contain: required lib '$need' (needed by ${b##*/}) is not bundled." >&2
+          echo "  Install it on the build host before building (e.g. 'apt-get install -y libaio1t64')." >&2
+          return 1
+        }
+      done < <(patchelf --print-needed "$b" 2>/dev/null)
+    done
+  fi
 }
 
 # apt_get <args...>: run apt-get as root directly, or via sudo if not root. Many CI
@@ -202,6 +315,39 @@ ensure_libaio() {
   fi
   [[ -n "$src" && -e "$src" ]] && { cp -L "$src" "$dest/libaio.so.1"; return 0; }
   return 1
+}
+
+# ensure_mariadb_build_deps: install the MariaDB-from-source toolchain (root-aware). MariaDB
+# source tarballs are NOT pre-generated, so bison (3+) is mandatory. On macOS we deliberately
+# do NOT install brew ncurses — the client links the system libncurses/libedit in /usr/lib
+# (present on every Mac, excluded from relocation); brew ncurses would leave a dangling @rpath.
+ensure_mariadb_build_deps() {
+  if [[ "$(host_os)" == linux ]]; then
+    command -v apt-get >/dev/null 2>&1 \
+      && apt_get install -y cmake bison libncurses-dev zlib1g-dev libevent-dev libssl-dev >/dev/null 2>&1 || true
+  else
+    if command -v brew >/dev/null 2>&1; then
+      command -v cmake >/dev/null 2>&1 || brew install cmake >/dev/null 2>&1 || true
+      brew list bison    >/dev/null 2>&1 || brew install bison    >/dev/null 2>&1 || true
+      brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3 >/dev/null 2>&1 || true
+      PATH="$(brew --prefix bison 2>/dev/null)/bin:$PATH"; export PATH
+    fi
+  fi
+  cmake --version >/dev/null 2>&1 || { echo "ensure_mariadb_build_deps: cmake not found" >&2; return 1; }
+  local bmaj
+  bmaj="$(bison --version 2>/dev/null | sed -n '1s/.* //p' | cut -d. -f1)"
+  [[ "${bmaj:-0}" -ge 3 ]] || { echo "ensure_mariadb_build_deps: bison >= 3 required ($(bison --version 2>/dev/null | head -1))" >&2; return 1; }
+}
+
+# ensure_mariadb_runtime_deps: install the linux-systemd bintar's runtime chain (root-aware) so
+# linux_self_contain's ldd sweep can bundle it. Tolerant per package (names vary across releases).
+ensure_mariadb_runtime_deps() {
+  [[ "$(host_os)" == linux ]] || return 0
+  command -v apt-get >/dev/null 2>&1 || return 0
+  local p
+  for p in libsystemd-dev liblzma5 libzstd1 liblz4-1 libcap2 libgcrypt20; do
+    apt_get install -y "$p" >/dev/null 2>&1 || true
+  done
 }
 
 # --- downloads -------------------------------------------------------------------

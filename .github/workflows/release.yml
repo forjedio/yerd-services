@@ -33,7 +33,7 @@ on:
         required: false
         default: ""
 
-# Serialize whole runs so two dispatches can't race on index.html / services.json.
+# Serialize whole runs so two dispatches can't race on services.json.
 concurrency:
   group: services-release
   cancel-in-progress: false
@@ -61,7 +61,10 @@ jobs:
           gh release view "$RELEASE_TAG" >/dev/null 2>&1 \
             || gh release create "$RELEASE_TAG" \
                  --title "yerd services" \
-                 --notes "Rolling release of yerd service binaries. Assets are managed by the release workflow; see index.html / services.json for the live listing."
+                 --notes "Rolling release of yerd service binaries. Assets are managed by the release workflow; see services.json for the live listing."
+      - name: Drop the legacy index.html listing if present
+        # The listing is now services.json; remove any leftover index.html.
+        run: gh release delete-asset "$RELEASE_TAG" index.html --yes || true
 
   build:
     if: ${{ inputs.action == 'build' }}
@@ -148,14 +151,10 @@ jobs:
             done
           done
 
-      - name: Regenerate listing + manifest from the live asset set
+      - name: Regenerate services.json from the live asset set
         run: |
-          # One asset query; two derived files. Upload services.json first, then
-          # index.html LAST and alone so the daemon's critical listing has the
-          # smallest possible window of being mid-clobber.
+          # The listing is services.json, derived from the release's live *.tar.gz assets.
           gh release view "$RELEASE_TAG" --json assets -q '.assets[].name' \
             | { grep '\.tar\.gz$' || true; } | LC_ALL=C sort > names.txt
-          scripts/gen-index.sh    < names.txt > index.html
           scripts/gen-manifest.sh < names.txt > services.json
           gh release upload "$RELEASE_TAG" services.json --clobber
-          gh release upload "$RELEASE_TAG" index.html   --clobber

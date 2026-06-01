@@ -84,53 +84,8 @@ case "$service" in
         || { echo "mysql(macos): no bundled .dylib under lib/" >&2; exit 1; }
       macos_make_relocatable "$stage"
     elif [[ "$OS" == linux ]]; then
-      # The Linux generic tarball dynamically links a few non-glibc system libs it
-      # doesn't bundle (notably libaio; sometimes libnuma/libtinfo). Copy them into
-      # lib/private/ so the artifact is self-contained on user machines, not just the CI
-      # runner. Leave glibc core + libstdc++/libgcc to the host to avoid ABI mixing.
-      #
-      mkdir -p "$stage/lib/private"
-      # Bundle whatever non-core deps are already resolvable on the host (libssl/libcrypto
-      # are already in lib/private from Oracle; this catches e.g. libnuma if present).
-      while IFS= read -r dep; do
-        cp -n "$dep" "$stage/lib/private/" 2>/dev/null || true
-      done < <(ldd "$stage/bin/mysqld" "$stage/bin/mysql" 2>/dev/null \
-        | awk '/=> \// && !/libc\.so|libm\.so|libpthread|libdl\.so|librt\.so|libresolv|ld-linux|linux-vdso|libstdc\+\+|libgcc_s/ {print $3}' \
-        | sort -u)
-      ensure_patchelf || true   # for the rpath fixup + self-containment gate below
-      # libaio.so.1 is hard-required and often absent from a bare build env; install it
-      # (root-aware) and copy it into lib/private. The gate below reports if it's missing.
-      ensure_libaio "$stage/lib/private" \
-        || echo "mysql(linux): could not provision libaio (gate will report)" >&2
-      # Strip debug symbols from the Linux binaries + shared libs — the main reason the
-      # Linux artifact dwarfs macOS. --strip-unneeded keeps the dynamic symbols .so files
-      # need; plain strip on the executables. (Skip the bundled host libs we just copied.)
-      strip "$stage/bin/mysqld" "$stage/bin/mysql" 2>/dev/null || true
-      find "$stage/lib" -type f \( -name '*.so' -o -name '*.so.*' \) \
-        -exec strip --strip-unneeded {} + 2>/dev/null || true
-      # Don't trust Oracle's baked rpath to cover lib/private — add it explicitly.
-      if command -v patchelf >/dev/null 2>&1; then
-        for b in "$stage/bin/mysqld" "$stage/bin/mysql"; do
-          patchelf --add-rpath '$ORIGIN/../lib/private' "$b" 2>/dev/null || true
-          patchelf --add-rpath '$ORIGIN/../lib' "$b" 2>/dev/null || true
-        done
-      fi
-      # Self-containment gate: every non-glibc/non-libstdc++ NEEDED lib of mysqld must be
-      # bundled under lib/, else the artifact runs on the CI host (which has the system
-      # lib) but breaks on a user machine — exactly the libaio.so.1 failure mode. Fail
-      # the build with a clear message instead of shipping it.
-      if command -v patchelf >/dev/null 2>&1; then
-        core='^(libc|libm|libmvec|libpthread|libdl|librt|libresolv|libstdc\+\+|libgcc_s|ld-linux.*)\.so'
-        while IFS= read -r need; do
-          [[ -z "$need" ]] && continue
-          echo "$need" | grep -Eq "$core" && continue
-          find "$stage/lib" -name "$need" | grep -q . || {
-            echo "mysql(linux): required lib '$need' is not bundled. Install it on the" >&2
-            echo "  build host before building (e.g. 'apt-get install -y libaio1t64')." >&2
-            exit 1
-          }
-        done < <(patchelf --print-needed "$stage/bin/mysqld" 2>/dev/null)
-      fi
+      # Sweep non-core deps into lib/private, ensure libaio, strip, rpath, gate (shared helper).
+      linux_self_contain "$stage" bin/mysqld bin/mysql
     fi
     require_files "$stage" bin/mysqld bin/mysql bin/mysqld_safe
     ;;
@@ -173,10 +128,78 @@ case "$service" in
     ;;
 
   mariadb)
-    # Phase 3: repackage Linux x86_64; build-from-source for macOS +
-    # Linux arm64 (CMake). Highest-effort engine. Not yet implemented.
-    echo "build-service.sh: mariadb not yet implemented (Phase 3)" >&2
-    exit 1
+    # Phase 3 (GPLv2). MariaDB ships ONLY a linux-systemd-x86_64 bintar — no ARM Linux,
+    # no macOS — so: repackage for linux-x86_64, build from source (CMake) everywhere else.
+    # Helper set: mariadb-install-db is a shell script that runs my_print_defaults and
+    # bootstraps via mariadbd, so all of these must ship together.
+    helpers=(mariadbd mariadb mariadb-install-db my_print_defaults mariadb-tzinfo-to-sql resolveip)
+
+    if [[ "$OS" == linux && "$ARCH" == x86_64 ]]; then
+      # ---- repackage the official linux-systemd-x86_64 bintar ----
+      url="https://archive.mariadb.org/mariadb-${upstream}/bintar-linux-systemd-x86_64/mariadb-${upstream}-linux-systemd-x86_64.tar.gz"
+      echo ">> mariadb source: $url"
+      fetch_to "$url" "$work/mariadb.tar.gz"
+      mkdir -p "$work/m"
+      tar xf "$work/mariadb.tar.gz" -C "$work/m" --strip-components 1
+      for h in "${helpers[@]}"; do
+        # bintar keeps mariadb-install-db under bin/ or scripts/; binaries under bin/.
+        if   [[ -e "$work/m/bin/$h" ]];     then cp "$work/m/bin/$h" "$stage/bin/"
+        elif [[ -e "$work/m/scripts/$h" ]]; then cp "$work/m/scripts/$h" "$stage/bin/"
+        fi
+      done
+      cp -R "$work/m/lib" "$stage/lib"
+      cp -R "$work/m/share" "$stage/share"
+      rm -f  "$stage"/lib/*.a 2>/dev/null || true
+      rm -rf "$stage"/lib/plugin/debug 2>/dev/null || true
+      # The linux-systemd bintar needs libsystemd + a chain (liblzma/libzstd/liblz4/libcap/…);
+      # provision them so linux_self_contain's ldd sweep bundles the whole chain (+ gates it).
+      ensure_mariadb_runtime_deps
+      linux_self_contain "$stage" bin/mariadbd bin/mariadb bin/my_print_defaults
+    else
+      # ---- build from source (linux-aarch64, macos-aarch64) ----
+      ensure_mariadb_build_deps || { echo "mariadb: build toolchain unavailable" >&2; exit 1; }
+      fetch_to "https://archive.mariadb.org/mariadb-${upstream}/source/mariadb-${upstream}.tar.gz" \
+        "$work/mariadb-src.tar.gz"
+      mkdir -p "$work/src"
+      tar xf "$work/mariadb-src.tar.gz" -C "$work/src" --strip-components 1
+      jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+      # Build dir is 'bld' NOT 'build' — macOS's case-insensitive fs collides with the
+      # in-tree BUILD/ dir. WITH_SSL=system → OpenSSL for BOTH server and the client connector
+      # (a small, bundleable 2-dylib tree). DISABLE_FIND_PACKAGE_GnuTLS stops the connector
+      # auto-linking brew GnuTLS (a huge p11-kit/nettle tree that's painful to bundle).
+      ssl_args=(-DWITH_SSL=system -DCMAKE_DISABLE_FIND_PACKAGE_GnuTLS=ON)
+      [[ "$OS" == macos ]] && ssl_args+=(-DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3 2>/dev/null)")
+      cmake -S "$work/src" -B "$work/bld" \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$work/mi" \
+        -DWITH_UNIT_TESTS=0 -DWITH_MARIABACKUP=0 -DWITH_EMBEDDED_SERVER=OFF \
+        -DPLUGIN_PERFSCHEMA=NO "${ssl_args[@]}" \
+        -DPLUGIN_CONNECT=NO -DPLUGIN_MROONGA=NO -DPLUGIN_ROCKSDB=NO -DPLUGIN_SPIDER=NO \
+        -DPLUGIN_COLUMNSTORE=NO -DPLUGIN_OQGRAPH=NO -DPLUGIN_SPHINX=NO -DPLUGIN_S3=NO
+      cmake --build "$work/bld" -j"$jobs"
+      cmake --install "$work/bld"
+      for h in "${helpers[@]}"; do
+        if   [[ -e "$work/mi/bin/$h" ]];     then cp "$work/mi/bin/$h" "$stage/bin/"
+        elif [[ -e "$work/mi/scripts/$h" ]]; then cp "$work/mi/scripts/$h" "$stage/bin/"
+        fi
+      done
+      cp -R "$work/mi/lib" "$stage/lib"
+      cp -R "$work/mi/share" "$stage/share"
+      rm -f "$stage"/lib/*.a 2>/dev/null || true
+      if [[ "$OS" == macos ]]; then
+        macos_bundle_external "$stage"     # copy brew OpenSSL (+ any external) dylibs into lib/
+        macos_make_relocatable "$stage"    # rewrite their refs to @rpath + re-sign
+        macos_self_contain_gate "$stage"   # fail if anything's still dangling/unbundled
+      else
+        linux_self_contain "$stage" bin/mariadbd bin/mariadb bin/my_print_defaults
+      fi
+    fi
+
+    # Both paths: assert the bootstrap inputs mariadb-install-db needs are present.
+    [[ -n "$(find "$stage/share" -name 'errmsg.sys' -print -quit)" ]] \
+      || { echo "mariadb: errmsg.sys missing from share/" >&2; exit 1; }
+    [[ -n "$(find "$stage/share" \( -name 'mariadb_system_tables.sql' -o -name 'mysql_system_tables.sql' \) -print -quit)" ]] \
+      || { echo "mariadb: system-table SQL missing from share/" >&2; exit 1; }
+    require_files "$stage" bin/mariadbd bin/mariadb bin/mariadb-install-db bin/my_print_defaults
     ;;
 
   *)
@@ -192,6 +215,7 @@ case "$service" in
   redis)    lic=valkey-BSD-3-Clause.txt ;;
   mysql)    lic=mysql-GPLv2.txt ;;
   postgres) lic=postgresql-PostgreSQL-License.txt ;;
+  mariadb)  lic=mariadb-GPLv2.txt ;;
   *)        lic="" ;;
 esac
 if [[ -n "$lic" ]]; then

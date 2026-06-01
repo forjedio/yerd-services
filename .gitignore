@@ -2,7 +2,6 @@
 /dist/
 
 # Generated listing/manifest (published as release assets, never committed)
-/index.html
 /services.json
 /names.txt
 

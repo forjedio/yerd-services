@@ -2,12 +2,11 @@
 #
 # gen-manifest.sh — read artifact filenames on stdin, emit services.json on stdout.
 #
-# This is an *additive* machine-readable mirror of the listing (NOT part of the
-# frozen consumer contract — the daemon still parses index.html). It lets agents /
-# tooling discover available versions without scraping HTML.
+# services.json is THE listing: GitHub Releases has no directory autoindex, so the
+# daemon fetches this machine-readable manifest to discover what's installable.
 #
-# Derived purely from the live *.tar.gz asset filenames (same input as
-# gen-index.sh), grouped service -> version -> [platforms]:
+# Derived purely from the live *.tar.gz asset filenames,
+# grouped service -> version -> [platforms]:
 #
 #   {"schema":1,"services":{"redis":{"versions":[
 #       {"version":"8","platforms":["linux-aarch64","linux-x86_64","macos-aarch64"]}

@@ -93,6 +93,21 @@ case "$service" in
     "$bin/mysql" --socket="$sock" -uroot -e 'SHUTDOWN'
     ;;
 
+  mariadb)
+    # Init with mariadb-install-db (shells out to my_print_defaults; reads share/), passwordless
+    # root via --auth-root-authentication-method=normal. Then start mariadbd and query.
+    sock="$sockdir/m.sock"
+    "$bin/mariadb-install-db" --no-defaults --basedir="$extract" --datadir="$data" \
+      --auth-root-authentication-method=normal >/dev/null
+    "$bin/mariadbd" --no-defaults --basedir="$extract" --datadir="$data" \
+      --socket="$sock" --port="$port" --skip-networking=0 &
+    srv_pid=$!
+    wait_for 60 "$bin/mariadb" --socket="$sock" -uroot -e 'SELECT 1'
+    out="$("$bin/mariadb" --socket="$sock" -uroot -N -e 'SELECT 1')"
+    [[ "$out" == "1" ]] || { echo "mariadb: SELECT 1 returned '$out'" >&2; exit 1; }
+    # mariadbd exits cleanly on the trap's SIGTERM; no client shutdown needed.
+    ;;
+
   postgres)
     "$bin/initdb" -A trust -U postgres --locale=C -D "$data" >/dev/null
     # -k sets the socket DIRECTORY; psql -h must be that same directory.
