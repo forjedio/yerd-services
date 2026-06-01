@@ -90,6 +90,13 @@ case "$service" in
     wait_for 60 "$bin/mysql" --socket="$sock" -uroot -e 'SELECT 1'
     out="$("$bin/mysql" --socket="$sock" -uroot -N -e 'SELECT 1')"
     [[ "$out" == "1" ]] || { echo "mysql: SELECT 1 returned '$out'" >&2; exit 1; }
+    # backup/restore roundtrip: dump bk, drop it, restore, verify the row survives.
+    "$bin/mysql" --socket="$sock" -uroot -e 'CREATE DATABASE bk; CREATE TABLE bk.t(id INT); INSERT INTO bk.t VALUES(42);'
+    "$bin/mysqldump" --no-tablespaces --single-transaction --socket="$sock" -uroot bk > "$extract/dump.sql"
+    "$bin/mysql" --socket="$sock" -uroot -e 'DROP DATABASE bk; CREATE DATABASE bk;'
+    "$bin/mysql" --socket="$sock" -uroot bk < "$extract/dump.sql"
+    rt="$("$bin/mysql" --socket="$sock" -uroot -N -e 'SELECT id FROM bk.t')"
+    [[ "$rt" == "42" ]] || { echo "mysql: backup/restore roundtrip got '$rt'" >&2; exit 1; }
     "$bin/mysql" --socket="$sock" -uroot -e 'SHUTDOWN'
     ;;
 
@@ -105,16 +112,34 @@ case "$service" in
     wait_for 60 "$bin/mariadb" --socket="$sock" -uroot -e 'SELECT 1'
     out="$("$bin/mariadb" --socket="$sock" -uroot -N -e 'SELECT 1')"
     [[ "$out" == "1" ]] || { echo "mariadb: SELECT 1 returned '$out'" >&2; exit 1; }
+    # backup/restore roundtrip: dump bk, drop it, restore, verify the row survives.
+    "$bin/mariadb" --socket="$sock" -uroot -e 'CREATE DATABASE bk; CREATE TABLE bk.t(id INT); INSERT INTO bk.t VALUES(42);'
+    "$bin/mariadb-dump" --no-tablespaces --single-transaction --socket="$sock" -uroot bk > "$extract/dump.sql"
+    "$bin/mariadb" --socket="$sock" -uroot -e 'DROP DATABASE bk; CREATE DATABASE bk;'
+    "$bin/mariadb" --socket="$sock" -uroot bk < "$extract/dump.sql"
+    rt="$("$bin/mariadb" --socket="$sock" -uroot -N -e 'SELECT id FROM bk.t')"
+    [[ "$rt" == "42" ]] || { echo "mariadb: backup/restore roundtrip got '$rt'" >&2; exit 1; }
     # mariadbd exits cleanly on the trap's SIGTERM; no client shutdown needed.
     ;;
 
   postgres)
     "$bin/initdb" -A trust -U postgres --locale=C -D "$data" >/dev/null
-    # -k sets the socket DIRECTORY; psql -h must be that same directory.
+    # -k sets the socket DIRECTORY; psql -h must be that same directory; -p must match the
+    # server's port on every connecting call.
     "$bin/pg_ctl" -D "$data" -o "-k $sockdir -p $port" -w -t 60 start
     out="$("$bin/psql" -h "$sockdir" -p "$port" -U postgres -tAc 'SELECT 1')"
-    "$bin/pg_ctl" -D "$data" -m fast stop
     [[ "$out" == "1" ]] || { echo "postgres: SELECT 1 returned '$out'" >&2; exit 1; }
+    # backup/restore roundtrip: dump bk (custom format), drop+recreate from a DIFFERENT db
+    # (can't drop the open one), pg_restore, verify the row survives.
+    "$bin/createdb" -h "$sockdir" -p "$port" -U postgres bk
+    "$bin/psql" -h "$sockdir" -p "$port" -U postgres -d bk -c 'CREATE TABLE t(id int); INSERT INTO t VALUES(42);' >/dev/null
+    "$bin/pg_dump" -Fc -h "$sockdir" -p "$port" -U postgres bk -f "$extract/d.dump"
+    "$bin/psql" -h "$sockdir" -p "$port" -U postgres -d postgres -c 'DROP DATABASE bk' -c 'CREATE DATABASE bk' >/dev/null
+    "$bin/pg_restore" -h "$sockdir" -p "$port" -U postgres -d bk "$extract/d.dump" >/dev/null
+    rt="$("$bin/psql" -h "$sockdir" -p "$port" -U postgres -d bk -tAc 'SELECT id FROM t')"
+    [[ "$rt" == "42" ]] || { echo "postgres: backup/restore roundtrip got '$rt'" >&2; exit 1; }
+    "$bin/pg_dumpall" --version >/dev/null   # 3rd tool: relocatable-runs sanity (shares libpq)
+    "$bin/pg_ctl" -D "$data" -m fast stop
     ;;
 
   *)

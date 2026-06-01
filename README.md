@@ -77,9 +77,9 @@ and points data/socket/port at user paths via config, never compiled-in defaults
 | service    | server binary | also include |
 |------------|---------------|--------------|
 | `redis`    | `valkey-server` | `valkey-cli` |
-| `mysql`    | `mysqld` | `mysql`, `mysqld_safe` |
-| `mariadb`  | `mariadbd` | `mariadb`, `mariadb-install-db` |
-| `postgres` | `postgres` | `initdb`, `pg_ctl`, `psql`, `createdb` |
+| `mysql`    | `mysqld` | `mysql`, `mysqld_safe`, `mysqldump` |
+| `mariadb`  | `mariadbd` | `mariadb`, `mariadb-install-db`, `mariadb-dump` |
+| `postgres` | `postgres` | `initdb`, `pg_ctl`, `psql`, `createdb`, `pg_dump`, `pg_dumpall`, `pg_restore` |
 
 **Listing (`services.json`):** GitHub Releases has no directory autoindex, so the workflow
 publishes a generated `services.json` manifest as a release asset; the daemon fetches it to
@@ -106,6 +106,23 @@ artifact          = {SERVICES_BASE_URL}/<filename>
 ```
 Integrity is TLS-only today (no checksum pinning), matching the PHP path.
 
+## Backup & restore
+
+Each **SQL** service ships the standard logical dump/restore tools in `bin/` so the daemon
+(`forjedio/yerd`) can shell out for `yerd service backup/restore` — backup runs the dump tool to
+a file, restore loads it back. (redis is excluded — its snapshot mechanism is RDB/AOF, not SQL.)
+
+| service | backup | restore | file |
+|---------|--------|---------|------|
+| `mysql`    | `mysqldump --no-tablespaces --single-transaction <db>` | `mysql <db> < dump.sql` | `.sql` |
+| `mariadb`  | `mariadb-dump --no-tablespaces --single-transaction <db>` | `mariadb <db> < dump.sql` | `.sql` |
+| `postgres` | `pg_dump <db>` (plain `.sql`) or `pg_dump -Fc <db>` (custom); `pg_dumpall` for cluster/roles | `psql <db> < dump.sql` (plain) or `pg_restore -d <db> dump.dump` (custom) | `.sql` / custom |
+
+Notes for the daemon: pass `--no-tablespaces` to mysqldump/mariadb-dump so a **non-root** backup
+user (no `PROCESS` privilege) works; `--single-transaction` gives a consistent InnoDB dump
+without `LOCK TABLES`. Every build smoke-tests a full backup→restore roundtrip before publishing,
+so these tools are verified relocatable and functional in the artifact.
+
 ## Hosting model
 
 A single **rolling release tagged `services`** holds every artifact + the listing as a flat
@@ -121,9 +138,9 @@ the escape hatch is to move `SERVICES_BASE_URL` to a CDN while keeping this arti
 | service | version | upstream source | how | notes |
 |---------|---------|-----------------|-----|-------|
 | `redis` | _(label)_ | [Valkey](https://github.com/valkey-io/valkey) tag `<upstream>` | build from source | `make -j BUILD_TLS=no` |
-| `mysql` | _(label)_ | [Oracle MySQL](https://dev.mysql.com/downloads/mysql/) generic tarball `<upstream>` (e.g. 8.4.9 LTS) | repackage | `bin/{mysqld,mysql,mysqld_safe}` + bundled `lib/`+`share/`; macOS dylib install-names made relocatable |
+| `mysql` | _(label)_ | [Oracle MySQL](https://dev.mysql.com/downloads/mysql/) generic tarball `<upstream>` (e.g. 8.4.9 LTS) | repackage | `bin/{mysqld,mysql,mysqld_safe,mysqldump}` + bundled `lib/`+`share/`; macOS dylib install-names made relocatable |
 | `postgres` | _(label)_ | [postgresql.org](https://ftp.postgresql.org/pub/source/) source `<upstream>` (e.g. 17.10) | build from source | `./configure --without-icu --without-readline --without-zlib --without-libxml` (no compressed `pg_dump`); macOS made relocatable |
-| `mariadb` | _(label)_ | [archive.mariadb.org](https://archive.mariadb.org/) `<upstream>` (e.g. 11.8.8 LTS) | repackage (linux-x86_64) / build from source (ARM Linux + macOS) | MariaDB ships only a `linux-systemd-x86_64` bintar; CMake build for the rest (`-DWITH_SSL=system`, heavy plugins trimmed). `bin/{mariadbd,mariadb,mariadb-install-db,my_print_defaults,…}` + `lib/`+`share/`; made relocatable + self-contained |
+| `mariadb` | _(label)_ | [archive.mariadb.org](https://archive.mariadb.org/) `<upstream>` (e.g. 11.8.8 LTS) | repackage (linux-x86_64) / build from source (ARM Linux + macOS) | MariaDB ships only a `linux-systemd-x86_64` bintar; CMake build for the rest (`-DWITH_SSL=system`, heavy plugins trimmed). `bin/{mariadbd,mariadb,mariadb-install-db,my_print_defaults,mariadb-dump,…}` + `lib/`+`share/`; made relocatable + self-contained |
 
 Each `(service, version)` is built per dispatch; the `<upstream>` actually used is whatever
 you pass. Every published artifact is **smoke-tested** on its native platform (start the

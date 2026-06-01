@@ -68,7 +68,8 @@ case "$service" in
     # tar xf auto-detects gz/xz (macOS=.tar.gz, linux=.tar.xz); --strip-components 1
     # drops the leading mysql-<...>/ dir.
     tar xf "$work/mysql.tar" -C "$work/m" --strip-components 1
-    cp "$work/m/bin/mysqld" "$work/m/bin/mysql" "$work/m/bin/mysqld_safe" "$stage/bin/"
+    cp "$work/m/bin/mysqld" "$work/m/bin/mysql" "$work/m/bin/mysqld_safe" \
+       "$work/m/bin/mysqldump" "$stage/bin/"
     # Ship lib/ and share/ WHOLESALE (no cherry-pick): mysqld needs errmsg.sys +
     # charsets under share/, plugins under lib/, and --initialize-insecure may consult
     # more. Trimming is a deferred optimization, guarded by the smoke test.
@@ -85,9 +86,9 @@ case "$service" in
       macos_make_relocatable "$stage"
     elif [[ "$OS" == linux ]]; then
       # Sweep non-core deps into lib/private, ensure libaio, strip, rpath, gate (shared helper).
-      linux_self_contain "$stage" bin/mysqld bin/mysql
+      linux_self_contain "$stage" bin/mysqld bin/mysql bin/mysqldump
     fi
-    require_files "$stage" bin/mysqld bin/mysql bin/mysqld_safe
+    require_files "$stage" bin/mysqld bin/mysql bin/mysqld_safe bin/mysqldump
     ;;
 
   postgres)
@@ -106,7 +107,8 @@ case "$service" in
     make -C "$work/pg" -j"$jobs"
     make -C "$work/pg" install-strip   # strip symbols (esp. large on Linux)
     cp "$work/pgi/bin/postgres" "$work/pgi/bin/initdb" "$work/pgi/bin/pg_ctl" \
-       "$work/pgi/bin/psql" "$work/pgi/bin/createdb" "$stage/bin/"
+       "$work/pgi/bin/psql" "$work/pgi/bin/createdb" \
+       "$work/pgi/bin/pg_dump" "$work/pgi/bin/pg_dumpall" "$work/pgi/bin/pg_restore" "$stage/bin/"
     # Postgres resolves share/ + lib/ relative to the executable, so ship them verbatim.
     cp -R "$work/pgi/lib" "$stage/lib"
     cp -R "$work/pgi/share" "$stage/share"
@@ -124,7 +126,8 @@ case "$service" in
       macos) macos_make_relocatable "$stage" ;;
       linux) linux_make_relocatable "$stage" ;;
     esac
-    require_files "$stage" bin/postgres bin/initdb bin/pg_ctl bin/psql bin/createdb
+    require_files "$stage" bin/postgres bin/initdb bin/pg_ctl bin/psql bin/createdb \
+      bin/pg_dump bin/pg_dumpall bin/pg_restore
     ;;
 
   mariadb)
@@ -132,7 +135,7 @@ case "$service" in
     # no macOS — so: repackage for linux-x86_64, build from source (CMake) everywhere else.
     # Helper set: mariadb-install-db is a shell script that runs my_print_defaults and
     # bootstraps via mariadbd, so all of these must ship together.
-    helpers=(mariadbd mariadb mariadb-install-db my_print_defaults mariadb-tzinfo-to-sql resolveip)
+    helpers=(mariadbd mariadb mariadb-install-db my_print_defaults mariadb-tzinfo-to-sql resolveip mariadb-dump)
 
     if [[ "$OS" == linux && "$ARCH" == x86_64 ]]; then
       # ---- repackage the official linux-systemd-x86_64 bintar ----
@@ -154,7 +157,7 @@ case "$service" in
       # The linux-systemd bintar needs libsystemd + a chain (liblzma/libzstd/liblz4/libcap/…);
       # provision them so linux_self_contain's ldd sweep bundles the whole chain (+ gates it).
       ensure_mariadb_runtime_deps
-      linux_self_contain "$stage" bin/mariadbd bin/mariadb bin/my_print_defaults
+      linux_self_contain "$stage" bin/mariadbd bin/mariadb bin/my_print_defaults bin/mariadb-dump
     else
       # ---- build from source (linux-aarch64, macos-aarch64) ----
       ensure_mariadb_build_deps || { echo "mariadb: build toolchain unavailable" >&2; exit 1; }
@@ -195,7 +198,7 @@ case "$service" in
         macos_make_relocatable "$stage"    # rewrite their refs to @rpath + re-sign
         macos_self_contain_gate "$stage"   # fail if anything's still dangling/unbundled
       else
-        linux_self_contain "$stage" bin/mariadbd bin/mariadb bin/my_print_defaults
+        linux_self_contain "$stage" bin/mariadbd bin/mariadb bin/my_print_defaults bin/mariadb-dump
       fi
     fi
 
@@ -204,7 +207,7 @@ case "$service" in
       || { echo "mariadb: errmsg.sys missing from share/" >&2; exit 1; }
     [[ -n "$(find "$stage/share" \( -name 'mariadb_system_tables.sql' -o -name 'mysql_system_tables.sql' \) -print -quit)" ]] \
       || { echo "mariadb: system-table SQL missing from share/" >&2; exit 1; }
-    require_files "$stage" bin/mariadbd bin/mariadb bin/mariadb-install-db bin/my_print_defaults
+    require_files "$stage" bin/mariadbd bin/mariadb bin/mariadb-install-db bin/my_print_defaults bin/mariadb-dump
     ;;
 
   *)
