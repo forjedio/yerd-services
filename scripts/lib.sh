@@ -150,13 +150,58 @@ macos_make_relocatable() {
 linux_make_relocatable() {
   local stage="$1" f
   [[ "$(host_os)" == linux ]] || return 0
-  command -v patchelf >/dev/null 2>&1 || { echo "linux_make_relocatable: patchelf not found" >&2; return 1; }
+  ensure_patchelf || { echo "linux_make_relocatable: patchelf not found and could not be installed" >&2; return 1; }
   while IFS= read -r f; do
     file -b "$f" 2>/dev/null | grep -q '^ELF' || continue
     # Generous multi-entry rpath covering every file location: bin/ (-> ../lib), libs in
     # lib/ ($ORIGIN), and nested lib/postgresql/*.so reaching lib/ ($ORIGIN/..).
     patchelf --set-rpath '$ORIGIN:$ORIGIN/..:$ORIGIN/../lib:$ORIGIN/../lib/postgresql' "$f" 2>/dev/null || true
   done < <(find "$stage/bin" "$stage/lib" -type f 2>/dev/null)
+}
+
+# apt_get <args...>: run apt-get as root directly, or via sudo if not root. Many CI
+# runners (root containers) have no `sudo` binary, so blindly prefixing sudo silently
+# fails — this picks the right one.
+apt_get() {
+  if [[ "$(id -u)" -eq 0 ]]; then apt-get "$@"; else sudo apt-get "$@"; fi
+}
+
+# ensure_patchelf: install patchelf (root-aware) if absent. Used by the Linux relocation
+# helpers so the build is self-sufficient regardless of the calling workflow. Returns
+# non-zero if it still isn't available.
+ensure_patchelf() {
+  command -v patchelf >/dev/null 2>&1 && return 0
+  command -v apt-get  >/dev/null 2>&1 || return 1
+  apt_get install -y patchelf >/dev/null 2>&1 || true
+  command -v patchelf >/dev/null 2>&1
+}
+
+# _libaio_path: print the path of a libaio shared object on the host, matching BOTH the
+# classic name (libaio.so.1[.x]) and Ubuntu 24.04's time64-renamed libaio.so.1t64[.x].
+# The time64 sweep renamed the SONAME but did not change the ABI.
+_libaio_path() {
+  local s
+  s="$(ldconfig -p 2>/dev/null | grep -oE '/[^ ]*libaio\.so\.1[^ ]*' | head -1)"
+  [[ -z "$s" ]] && s="$(find /usr/lib /usr/lib64 /lib /lib64 -name 'libaio.so.1*' 2>/dev/null | head -1)"
+  [[ -n "$s" ]] && printf '%s\n' "$s"
+}
+
+# ensure_libaio <dest_dir>: make sure libaio.so.1 lands in <dest_dir>. MySQL's Linux
+# generic binaries hard-link libaio.so.1, which a bare build env often lacks (and on
+# Ubuntu 24.04 the package only provides libaio.so.1t64). Install it (root-aware) if
+# absent, then copy whatever object we find as libaio.so.1 — the name mysqld's DT_NEEDED
+# wants. Returns non-zero if still unavailable (caller's gate reports it).
+ensure_libaio() {
+  local dest="$1" src
+  mkdir -p "$dest"
+  src="$(_libaio_path)"
+  if [[ -z "$src" ]] && command -v apt-get >/dev/null 2>&1; then
+    apt_get install -y libaio1t64 >/dev/null 2>&1 \
+      || apt_get install -y libaio1 >/dev/null 2>&1 || true
+    src="$(_libaio_path)"
+  fi
+  [[ -n "$src" && -e "$src" ]] && { cp -L "$src" "$dest/libaio.so.1"; return 0; }
+  return 1
 }
 
 # --- downloads -------------------------------------------------------------------

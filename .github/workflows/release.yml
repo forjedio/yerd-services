@@ -78,20 +78,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - name: Linux build/runtime deps
-        # patchelf: relocation primitive (linux_make_relocatable) for any service.
-        # mysql: libaio (+ libnuma/libncurses) are dynamically linked by the Oracle
-        # tarball and aren't on runners by default — needed so the smoke test can start
-        # mysqld (the recipe also bundles them into the artifact for end users).
-        if: ${{ runner.os == 'Linux' }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y patchelf
-          if [[ "${{ inputs.service }}" == "mysql" ]]; then
-            for p in libaio1t64 libaio1 libnuma1 libncurses6 libtinfo6; do
-              sudo apt-get install -y "$p" || true   # names vary across Ubuntu releases
-            done
-          fi
+      # No separate dep-install step: build-service.sh self-provisions what it needs on
+      # Linux (patchelf for relocation; libaio for the MySQL repackage), root-aware, so it
+      # works the same whether run here or standalone.
       - name: Build artifact for ${{ matrix.target }}
         run: |
           scripts/build-service.sh "${{ inputs.service }}" "${{ inputs.version }}" "${{ inputs.upstream }}"

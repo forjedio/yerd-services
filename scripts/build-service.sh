@@ -83,24 +83,19 @@ case "$service" in
       # lib/private/ so the artifact is self-contained on user machines, not just the CI
       # runner. Leave glibc core + libstdc++/libgcc to the host to avoid ABI mixing.
       #
-      # We can only copy what's present on the BUILD host, and MySQL hard-links
-      # libaio.so.1 (and may link libnuma) — so self-provision the non-base deps on
-      # apt-based hosts (no-op if already present or not Debian/Ubuntu). Package names
-      # vary across Ubuntu releases, so try each. The self-containment gate below is the
-      # backstop if anything is still missing.
-      if command -v apt-get >/dev/null 2>&1 \
-         && ! ldconfig -p 2>/dev/null | grep -q 'libaio\.so\.1'; then
-        sudo apt-get update -qq 2>/dev/null || true
-        for p in libaio1t64 libaio1 libnuma1 libncurses6 libtinfo6; do
-          sudo apt-get install -y "$p" 2>/dev/null || true
-        done
-      fi
       mkdir -p "$stage/lib/private"
+      # Bundle whatever non-core deps are already resolvable on the host (libssl/libcrypto
+      # are already in lib/private from Oracle; this catches e.g. libnuma if present).
       while IFS= read -r dep; do
         cp -n "$dep" "$stage/lib/private/" 2>/dev/null || true
       done < <(ldd "$stage/bin/mysqld" "$stage/bin/mysql" 2>/dev/null \
         | awk '/=> \// && !/libc\.so|libm\.so|libpthread|libdl\.so|librt\.so|libresolv|ld-linux|linux-vdso|libstdc\+\+|libgcc_s/ {print $3}' \
         | sort -u)
+      ensure_patchelf || true   # for the rpath fixup + self-containment gate below
+      # libaio.so.1 is hard-required and often absent from a bare build env; install it
+      # (root-aware) and copy it into lib/private. The gate below reports if it's missing.
+      ensure_libaio "$stage/lib/private" \
+        || echo "mysql(linux): could not provision libaio (gate will report)" >&2
       # Don't trust Oracle's baked rpath to cover lib/private — add it explicitly.
       if command -v patchelf >/dev/null 2>&1; then
         for b in "$stage/bin/mysqld" "$stage/bin/mysql"; do
