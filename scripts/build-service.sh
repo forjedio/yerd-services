@@ -51,6 +51,9 @@ case "$service" in
     # Valkey emits its binaries into its own src/ subdir, so they live at
     # "$work/src/src/valkey-{server,cli}" (the doubled src/ is intentional).
     cp "$work/src/src/valkey-server" "$work/src/src/valkey-cli" "$stage/bin/"
+    # Strip debug symbols on Linux (the source build leaves them in the ELF; on macOS
+    # they live in a separate .dSYM we don't ship, so it's already lean).
+    [[ "$OS" == linux ]] && strip "$stage/bin/valkey-server" "$stage/bin/valkey-cli" 2>/dev/null || true
     require_files "$stage" bin/valkey-server bin/valkey-cli
     ;;
 
@@ -71,6 +74,9 @@ case "$service" in
     # more. Trimming is a deferred optimization, guarded by the smoke test.
     cp -R "$work/m/lib" "$stage/lib"
     cp -R "$work/m/share" "$stage/share"
+    # Drop artifacts that aren't needed to RUN the server (big size wins):
+    rm -f  "$stage"/lib/*.a 2>/dev/null || true            # static libs — compile-time only
+    rm -rf "$stage"/lib/plugin/debug 2>/dev/null || true   # debug-instrumented plugin builds
     # Guard against an empty bundle (a dead artifact only the smoke test would catch).
     [[ -d "$stage/lib" ]] || { echo "mysql: staged lib/ missing" >&2; exit 1; }
     if [[ "$OS" == macos ]]; then
@@ -96,6 +102,12 @@ case "$service" in
       # (root-aware) and copy it into lib/private. The gate below reports if it's missing.
       ensure_libaio "$stage/lib/private" \
         || echo "mysql(linux): could not provision libaio (gate will report)" >&2
+      # Strip debug symbols from the Linux binaries + shared libs — the main reason the
+      # Linux artifact dwarfs macOS. --strip-unneeded keeps the dynamic symbols .so files
+      # need; plain strip on the executables. (Skip the bundled host libs we just copied.)
+      strip "$stage/bin/mysqld" "$stage/bin/mysql" 2>/dev/null || true
+      find "$stage/lib" -type f \( -name '*.so' -o -name '*.so.*' \) \
+        -exec strip --strip-unneeded {} + 2>/dev/null || true
       # Don't trust Oracle's baked rpath to cover lib/private — add it explicitly.
       if command -v patchelf >/dev/null 2>&1; then
         for b in "$stage/bin/mysqld" "$stage/bin/mysql"; do
@@ -137,7 +149,7 @@ case "$service" in
     ( cd "$work/pg" && ./configure --prefix="$work/pgi" \
         --without-icu --without-readline --without-zlib --without-libxml )
     make -C "$work/pg" -j"$jobs"
-    make -C "$work/pg" install
+    make -C "$work/pg" install-strip   # strip symbols (esp. large on Linux)
     cp "$work/pgi/bin/postgres" "$work/pgi/bin/initdb" "$work/pgi/bin/pg_ctl" \
        "$work/pgi/bin/psql" "$work/pgi/bin/createdb" "$stage/bin/"
     # Postgres resolves share/ + lib/ relative to the executable, so ship them verbatim.
