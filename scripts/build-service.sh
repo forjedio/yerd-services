@@ -38,6 +38,112 @@ trap 'rm -rf "$stage" "$work"' EXIT
 
 echo ">> building service=$service version=$version upstream=$upstream os=$OS arch=$ARCH"
 
+# win_stage_bin <vendor_root> <stage> <exe...>: copy the named vendor executables PLUS
+# every sibling DLL from <vendor_root>/bin into <stage>/bin. On Windows the loader finds
+# DLLs next to the .exe, so the runtime DLLs (OpenSSL, libpq, libiconv, …) that vendor
+# zips keep in bin/ MUST travel with the exes — copying all bin/*.dll is what makes the
+# artifact self-contained (the inverse of the Unix lib/ layout).
+win_stage_bin() {
+  local root="$1" stage="$2"; shift 2
+  local e
+  for e in "$@"; do
+    if   [[ -e "$root/bin/$e" ]];     then cp "$root/bin/$e" "$stage/bin/"
+    elif [[ -e "$root/$e" ]];         then cp "$root/$e" "$stage/bin/"   # flat zips (redis)
+    else echo "win_stage_bin: missing '$e' under '$root'" >&2; return 1; fi
+  done
+  cp "$root"/bin/*.dll "$stage/bin/" 2>/dev/null || true
+  cp "$root"/*.dll     "$stage/bin/" 2>/dev/null || true   # flat zips (redis)
+  # Drop debug-build DLLs the vendor ships alongside the release ones (e.g. MySQL's
+  # *-debug.dll for abseil/protobuf) — never imported by the staged exes, just dead weight.
+  rm -f "$stage"/bin/*-debug.dll 2>/dev/null || true
+  return 0
+}
+
+if [[ "$OS" == windows ]]; then
+  # ---- Windows (x86_64): repackage the official vendor winx64 zips ----
+  # No rpath/install_name on Windows: self-containment = DLLs next to the .exe in bin/.
+  # vendor zips keep their runtime DLLs in bin/ (NOT lib/), so win_stage_bin copies them.
+  case "$service" in
+    redis)
+      # Windows ships REDIS (native MSVC port), not Valkey (valkey #92: no Windows build).
+      # Upstream is platform-divergent: ignore the Valkey tag, use the pinned Redis-port
+      # version. Real names kept (redis-server.exe/redis-cli.exe) — no rename to valkey-*.
+      win_up="${REDIS_WIN_UPSTREAM:-5.0.14.1}"
+      url="$(redis_win_url "$win_up")"
+      echo ">> redis(windows) source: $url"
+      fetch_to "$url" "$work/redis.zip"
+      unzip_vendor "$work/redis.zip" "$work/r"
+      root="$(vendor_root "$work/r")"
+      win_stage_bin "$root" "$stage" redis-server.exe redis-cli.exe
+      windows_bundle_runtime "$stage"
+      windows_self_contain_gate "$stage"
+      require_files "$stage" bin/redis-server.exe bin/redis-cli.exe
+      ;;
+
+    mysql)
+      url="$(mysql_win_url "$upstream")"
+      echo ">> mysql(windows) source: $url"
+      fetch_to "$url" "$work/mysql.zip"
+      unzip_vendor "$work/mysql.zip" "$work/m"
+      root="$(vendor_root "$work/m" "mysql-${upstream}-winx64")"
+      # mysqld.exe + client/dump; NO mysqld_safe (Unix-only shell script).
+      win_stage_bin "$root" "$stage" mysqld.exe mysql.exe mysqldump.exe
+      # share/ holds errmsg.sys + charsets; lib/plugin holds runtime plugins.
+      cp -R "$root/share" "$stage/share"
+      [[ -d "$root/lib/plugin" ]] && { mkdir -p "$stage/lib"; cp -R "$root/lib/plugin" "$stage/lib/plugin"; }
+      windows_bundle_runtime "$stage"
+      windows_self_contain_gate "$stage"
+      require_files "$stage" bin/mysqld.exe bin/mysql.exe bin/mysqldump.exe
+      ;;
+
+    mariadb)
+      url="$(mariadb_win_url "$upstream")"
+      echo ">> mariadb(windows) source: $url"
+      fetch_to "$url" "$work/mariadb.zip"
+      unzip_vendor "$work/mariadb.zip" "$work/m"
+      root="$(vendor_root "$work/m" "mariadb-${upstream}-winx64")"
+      # Probe the Windows init tool name (varies: mariadb-install-db.exe | mysql_install_db.exe).
+      init_tool=""
+      for cand in mariadb-install-db.exe mysql_install_db.exe; do
+        [[ -e "$root/bin/$cand" ]] && { init_tool="$cand"; break; }
+      done
+      [[ -n "$init_tool" ]] || { echo "mariadb(windows): no init tool (mariadb-install-db.exe/mysql_install_db.exe)" >&2; exit 1; }
+      win_stage_bin "$root" "$stage" mariadbd.exe mariadb.exe mariadb-dump.exe "$init_tool"
+      cp -R "$root/share" "$stage/share"
+      [[ -d "$root/lib/plugin" ]] && { mkdir -p "$stage/lib"; cp -R "$root/lib/plugin" "$stage/lib/plugin"; }
+      # Same bootstrap-input asserts as the Unix paths.
+      [[ -n "$(find "$stage/share" -name 'errmsg.sys' -print -quit)" ]] \
+        || { echo "mariadb: errmsg.sys missing from share/" >&2; exit 1; }
+      [[ -n "$(find "$stage/share" \( -name 'mariadb_system_tables.sql' -o -name 'mysql_system_tables.sql' \) -print -quit)" ]] \
+        || { echo "mariadb: system-table SQL missing from share/" >&2; exit 1; }
+      windows_bundle_runtime "$stage"
+      windows_self_contain_gate "$stage"
+      require_files "$stage" bin/mariadbd.exe bin/mariadb.exe bin/mariadb-dump.exe "bin/$init_tool"
+      ;;
+
+    postgres)
+      url="$(postgres_win_url "$upstream")"
+      echo ">> postgres(windows) source: $url"
+      fetch_to "$url" "$work/pg.zip"
+      unzip_vendor "$work/pg.zip" "$work/pg"
+      root="$(vendor_root "$work/pg" "pgsql")"
+      win_stage_bin "$root" "$stage" postgres.exe initdb.exe pg_ctl.exe psql.exe \
+        createdb.exe pg_dump.exe pg_dumpall.exe pg_restore.exe
+      # EDB resolves share/ + lib/ relative to the exe — ship them verbatim.
+      cp -R "$root/share" "$stage/share"
+      cp -R "$root/lib" "$stage/lib"
+      windows_bundle_runtime "$stage"
+      windows_self_contain_gate "$stage"
+      require_files "$stage" bin/postgres.exe bin/initdb.exe bin/pg_ctl.exe bin/psql.exe \
+        bin/createdb.exe bin/pg_dump.exe bin/pg_dumpall.exe bin/pg_restore.exe
+      ;;
+
+    *)
+      echo "build-service.sh: unhandled service '$service' (windows)" >&2
+      exit 1
+      ;;
+  esac
+else
 case "$service" in
   redis)
     # redis slot -> Valkey, built from source. BSD-3, relocatable,
@@ -215,20 +321,33 @@ case "$service" in
     exit 1
     ;;
 esac
+fi
 
 # Ship the upstream license inside the artifact (required for GPLv2 redistribution of
 # MySQL — which we additionally modify via install_name_tool/codesign on macOS — and
 # good practice for the others).
-case "$service" in
-  redis)    lic=valkey-BSD-3-Clause.txt ;;
-  mysql)    lic=mysql-GPLv2.txt ;;
-  postgres) lic=postgresql-PostgreSQL-License.txt ;;
-  mariadb)  lic=mariadb-GPLv2.txt ;;
-  *)        lic="" ;;
-esac
-if [[ -n "$lic" ]]; then
-  [[ -f "$repo_root/LICENSES/$lic" ]] || { echo "missing LICENSES/$lic" >&2; exit 1; }
-  cp "$repo_root/LICENSES/$lic" "$stage/LICENSE"
+if [[ "$OS" == windows && "$service" == redis ]]; then
+  # Windows redis is the native MSVC port of REDIS (pre-7.4 BSD-3), not Valkey. Ship the
+  # upstream Redis BSD license, the port's combined BSD-3 notice, AND the notices for the
+  # permissive deps statically linked into redis-server.exe (Lua/hiredis/jemalloc/linenoise),
+  # all required for binary redistribution.
+  mkdir -p "$stage/LICENSES"
+  for l in redis-BSD-3-Clause.txt redis-windows-port-BSD-3-Clause.txt redis-windows-third-party-NOTICES.txt; do
+    [[ -f "$repo_root/LICENSES/$l" ]] || { echo "missing LICENSES/$l" >&2; exit 1; }
+    cp "$repo_root/LICENSES/$l" "$stage/LICENSES/$l"
+  done
+else
+  case "$service" in
+    redis)    lic=valkey-BSD-3-Clause.txt ;;
+    mysql)    lic=mysql-GPLv2.txt ;;
+    postgres) lic=postgresql-PostgreSQL-License.txt ;;
+    mariadb)  lic=mariadb-GPLv2.txt ;;
+    *)        lic="" ;;
+  esac
+  if [[ -n "$lic" ]]; then
+    [[ -f "$repo_root/LICENSES/$lic" ]] || { echo "missing LICENSES/$lic" >&2; exit 1; }
+    cp "$repo_root/LICENSES/$lic" "$stage/LICENSE"
+  fi
 fi
 
 pack_stage "$stage" "$out"

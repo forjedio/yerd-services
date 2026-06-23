@@ -23,6 +23,7 @@ fi
 # Canonicalize first so service=valkey maps to the redis branch (do-not-regress).
 service="$(canonical_service "$1")"
 tarball="$2"
+OS="$(host_os)"   # smoke-test branches on this; lib.sh defines host_os
 [[ -f "$tarball" ]] || { echo "smoke-test.sh: tarball not found: $tarball" >&2; exit 2; }
 
 # Extract dir can be deep; the unix socket must NOT live here. macOS caps
@@ -38,8 +39,18 @@ cleanup() {
     wait "$srv_pid" 2>/dev/null || true
   fi
   # postgres runs under its own postmaster (not $srv_pid) — stop it if still up.
+  # (Git Bash auto-appends .exe, so this resolves pg_ctl.exe on Windows too.)
   if [[ -f "$data/postmaster.pid" ]]; then
     "$extract/bin/pg_ctl" -D "$data" -m immediate stop >/dev/null 2>&1 || true
+  fi
+  # Windows last-resort reaper: kill "$srv_pid" targets the MSYS pid, which may not reap
+  # the native .exe (or its workers). Clean shutdown in each branch is primary; this only
+  # fires in CI (avoid taskkilling a dev box's own engines by image name).
+  if [[ "$OS" == windows && -n "${GITHUB_ACTIONS:-}${CI:-}" ]]; then
+    local img
+    for img in redis-server.exe mysqld.exe mariadbd.exe postgres.exe; do
+      taskkill //IM "$img" //F >/dev/null 2>&1 || true
+    done
   fi
   rm -rf "$extract" "$sockdir"
 }
@@ -62,6 +73,90 @@ wait_for() {
 }
 
 echo ">> smoke-testing $service from $tarball"
+
+if [[ "$OS" == windows ]]; then
+  # Windows: no unix sockets — everything over TCP loopback. Binaries are .exe; the
+  # redis slot ships the real REDIS port (redis-server.exe / redis-cli.exe), not Valkey.
+  case "$service" in
+    redis)
+      mkdir -p "$data"
+      "$bin/redis-server.exe" --port "$port" --dir "$data" --save '' --appendonly no &
+      srv_pid=$!
+      wait_for 15 "$bin/redis-cli.exe" -p "$port" ping
+      [[ "$("$bin/redis-cli.exe" -p "$port" ping)" == "PONG" ]] || { echo "redis: no PONG" >&2; exit 1; }
+      "$bin/redis-cli.exe" -p "$port" set yerd ok >/dev/null
+      [[ "$("$bin/redis-cli.exe" -p "$port" get yerd)" == "ok" ]] || { echo "redis: SET/GET failed" >&2; exit 1; }
+      "$bin/redis-cli.exe" -p "$port" shutdown nosave 2>/dev/null || true
+      ;;
+
+    mysql)
+      "$bin/mysqld.exe" --no-defaults --initialize-insecure \
+        --basedir="$extract" --datadir="$data"
+      "$bin/mysqld.exe" --no-defaults --basedir="$extract" --datadir="$data" \
+        --port="$port" --skip-networking=0 --mysqlx=0 &
+      srv_pid=$!
+      wait_for 60 "$bin/mysql.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot -e 'SELECT 1'
+      out="$("$bin/mysql.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot -N -e 'SELECT 1')"
+      [[ "$out" == "1" ]] || { echo "mysql: SELECT 1 returned '$out'" >&2; exit 1; }
+      "$bin/mysql.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot -e 'CREATE DATABASE bk; CREATE TABLE bk.t(id INT); INSERT INTO bk.t VALUES(42);'
+      "$bin/mysqldump.exe" --no-tablespaces --single-transaction --protocol=TCP -h 127.0.0.1 -P "$port" -uroot bk > "$extract/dump.sql"
+      "$bin/mysql.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot -e 'DROP DATABASE bk; CREATE DATABASE bk;'
+      "$bin/mysql.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot bk < "$extract/dump.sql"
+      rt="$("$bin/mysql.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot -N -e 'SELECT id FROM bk.t')"
+      [[ "$rt" == "42" ]] || { echo "mysql: backup/restore roundtrip got '$rt'" >&2; exit 1; }
+      "$bin/mysql.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot -e 'SHUTDOWN'
+      ;;
+
+    mariadb)
+      init=""
+      for c in mariadb-install-db.exe mysql_install_db.exe; do
+        [[ -e "$bin/$c" ]] && { init="$c"; break; }
+      done
+      [[ -n "$init" ]] || { echo "mariadb(windows): no init tool in artifact" >&2; exit 1; }
+      # Windows install-db: passwordless root by default; pass basedir+datadir.
+      "$bin/$init" --no-defaults --datadir="$data" >/dev/null 2>&1 \
+        || "$bin/$init" --datadir="$data" >/dev/null
+      "$bin/mariadbd.exe" --no-defaults --basedir="$extract" --datadir="$data" \
+        --port="$port" --skip-networking=0 &
+      srv_pid=$!
+      wait_for 60 "$bin/mariadb.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot -e 'SELECT 1'
+      out="$("$bin/mariadb.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot -N -e 'SELECT 1')"
+      [[ "$out" == "1" ]] || { echo "mariadb: SELECT 1 returned '$out'" >&2; exit 1; }
+      "$bin/mariadb.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot -e 'CREATE DATABASE bk; CREATE TABLE bk.t(id INT); INSERT INTO bk.t VALUES(42);'
+      "$bin/mariadb-dump.exe" --no-tablespaces --single-transaction --protocol=TCP -h 127.0.0.1 -P "$port" -uroot bk > "$extract/dump.sql"
+      "$bin/mariadb.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot -e 'DROP DATABASE bk; CREATE DATABASE bk;'
+      "$bin/mariadb.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot bk < "$extract/dump.sql"
+      rt="$("$bin/mariadb.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot -N -e 'SELECT id FROM bk.t')"
+      [[ "$rt" == "42" ]] || { echo "mariadb: backup/restore roundtrip got '$rt'" >&2; exit 1; }
+      "$bin/mariadb.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot -e 'SHUTDOWN' 2>/dev/null || true
+      ;;
+
+    postgres)
+      # initdb/postgres auto-drop the runner's admin token on Windows; pg_ctl is the path
+      # that performs the de-elevation. -A trust covers local + host(127.0.0.1) auth.
+      "$bin/initdb.exe" -A trust -U postgres --locale=C -D "$data" >/dev/null
+      "$bin/pg_ctl.exe" -D "$data" -o "-p $port" -w -t 60 start
+      out="$("$bin/psql.exe" -h 127.0.0.1 -p "$port" -U postgres -tAc 'SELECT 1')"
+      [[ "$out" == "1" ]] || { echo "postgres: SELECT 1 returned '$out'" >&2; exit 1; }
+      "$bin/createdb.exe" -h 127.0.0.1 -p "$port" -U postgres bk
+      "$bin/psql.exe" -h 127.0.0.1 -p "$port" -U postgres -d bk -c 'CREATE TABLE t(id int); INSERT INTO t VALUES(42);' >/dev/null
+      "$bin/pg_dump.exe" -Fc -h 127.0.0.1 -p "$port" -U postgres bk -f "$extract/d.dump"
+      "$bin/psql.exe" -h 127.0.0.1 -p "$port" -U postgres -d postgres -c 'DROP DATABASE bk' -c 'CREATE DATABASE bk' >/dev/null
+      "$bin/pg_restore.exe" -h 127.0.0.1 -p "$port" -U postgres -d bk "$extract/d.dump" >/dev/null
+      rt="$("$bin/psql.exe" -h 127.0.0.1 -p "$port" -U postgres -d bk -tAc 'SELECT id FROM t')"
+      [[ "$rt" == "42" ]] || { echo "postgres: backup/restore roundtrip got '$rt'" >&2; exit 1; }
+      "$bin/pg_dumpall.exe" --version >/dev/null
+      "$bin/pg_ctl.exe" -D "$data" -m fast stop
+      ;;
+
+    *)
+      echo "smoke-test.sh: unhandled service '$service' (windows)" >&2
+      exit 1
+      ;;
+  esac
+  echo ">> smoke test OK: $service"
+  exit 0
+fi
 
 case "$service" in
   redis)
