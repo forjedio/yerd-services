@@ -378,6 +378,7 @@ ensure_mariadb_runtime_deps() {
 # and may be unset). 7-Zip (preinstalled on GitHub windows runners) is the fallback.
 # `unzip` is intentionally not used (not guaranteed in Git Bash). No-op-safe off Windows.
 unzip_vendor() {
+  [[ "$(host_os)" == windows ]] || return 0   # honor the "No-op-safe off Windows" header
   local zip="$1" dest="$2" sysroot bsdtar
   mkdir -p "$dest"
   sysroot="${SYSTEMROOT:-${WINDIR:-C:\\Windows}}"
