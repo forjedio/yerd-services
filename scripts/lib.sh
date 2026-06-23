@@ -11,13 +11,16 @@ set -euo pipefail
 # --- platform tokens ------------------------------------------------------------
 
 # host_os: map `uname -s` to the contract os token. Fails loudly on anything else.
+# Git Bash / MSYS2 report MINGW64_NT-*, MSYS_NT-*, CYGWIN_NT-* (and some shells set
+# Windows_NT) — all map to the `windows` token.
 host_os() {
   local s
   s="$(uname -s)"
   case "$s" in
-    Darwin) echo macos ;;
-    Linux)  echo linux ;;
-    *) echo "lib.sh: unsupported OS '$s' (want Darwin|Linux)" >&2; return 1 ;;
+    Darwin)                          echo macos ;;
+    Linux)                           echo linux ;;
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) echo windows ;;
+    *) echo "lib.sh: unsupported OS '$s' (want Darwin|Linux|MINGW*/MSYS*/CYGWIN*)" >&2; return 1 ;;
   esac
 }
 
@@ -71,12 +74,19 @@ make_stage() {
 
 # require_files <dir> <relpath...>: assert each path exists under <dir> and is
 # executable, so a broken build fails the runner instead of shipping a bad archive.
+# On Windows the `-x` test is unreliable under Git Bash on NTFS-extracted files (it
+# depends on the mount's acl/noacl mode and how the file arrived), so there we assert
+# `-f` (a regular file) instead — which still catches a stray directory or a
+# zero-byte/failed copy, just not the meaningless exec bit.
 require_files() {
   local dir="$1"; shift
-  local rel missing=0
+  local rel missing=0 os
+  os="$(host_os)"
   for rel in "$@"; do
     if [[ ! -e "$dir/$rel" ]]; then
       echo "require_files: missing '$rel' in stage '$dir'" >&2; missing=1
+    elif [[ "$os" == windows ]]; then
+      [[ -f "$dir/$rel" ]] || { echo "require_files: '$rel' is not a regular file" >&2; missing=1; }
     elif [[ ! -x "$dir/$rel" ]]; then
       echo "require_files: '$rel' is not executable" >&2; missing=1
     fi
@@ -87,16 +97,25 @@ require_files() {
 # pack_stage <stage_dir> <out_tar>: tar the stage root (so bin/ lands at archive
 # root) into out_tar as gzip. Preserves the executable bit; no absolute/.. members.
 pack_stage() {
-  local stage_dir="$1" out="$2"
+  local stage_dir="$1" out="$2" os
+  os="$(host_os)"
   mkdir -p "$(dirname "$out")"
-  chmod +x "$stage_dir"/bin/* 2>/dev/null || true
-  if [[ "$(host_os)" == macos ]]; then
+  if [[ "$os" == macos ]]; then
+    chmod +x "$stage_dir"/bin/* 2>/dev/null || true
     # bsdtar: COPYFILE_DISABLE=1 stops AppleDouble ._* companions; --no-xattrs drops
     # extended attrs; the --excludes are defense-in-depth. Dashed -czf (NOT bare czf):
     # bsdtar rejects a bare mode bundle after long options.
     COPYFILE_DISABLE=1 tar --no-xattrs --exclude='.DS_Store' --exclude='._*' \
       -czf "$out" -C "$stage_dir" .
+  elif [[ "$os" == windows ]]; then
+    # NTFS has no exec bit; force a deterministic 0755 mode (what GNU tar writes into
+    # the header) rather than relying on the ambiguous extracted bit. The WRITE path
+    # uses Git's GNU tar — fine for emitting .tar.gz (MSYS paths are /c/..., no
+    # drive-colon issue); only zip READS need bsdtar (see unzip_vendor).
+    chmod 0755 "$stage_dir"/bin/* 2>/dev/null || true
+    tar -czf "$out" -C "$stage_dir" .
   else
+    chmod +x "$stage_dir"/bin/* 2>/dev/null || true
     tar -czf "$out" -C "$stage_dir" .
   fi
 }
@@ -350,6 +369,165 @@ ensure_mariadb_runtime_deps() {
   done
 }
 
+# --- Windows: extraction, runtime bundling, self-containment ---------------------
+
+# unzip_vendor <zip> <dest>: extract a vendor .zip into <dest>. Git Bash's `tar` is
+# GNU tar (/usr/bin/tar), which does NOT read zip and SHADOWS the System32 bsdtar on
+# PATH, so we invoke the Windows system bsdtar by absolute path (resolved defensively —
+# the Windows SystemRoot value is a backslashed C:\Windows that bash can't path-resolve
+# and may be unset). 7-Zip (preinstalled on GitHub windows runners) is the fallback.
+# `unzip` is intentionally not used (not guaranteed in Git Bash). No-op-safe off Windows.
+unzip_vendor() {
+  [[ "$(host_os)" == windows ]] || return 0   # honor the "No-op-safe off Windows" header
+  local zip="$1" dest="$2" sysroot bsdtar
+  mkdir -p "$dest"
+  sysroot="${SYSTEMROOT:-${WINDIR:-C:\\Windows}}"
+  if command -v cygpath >/dev/null 2>&1; then sysroot="$(cygpath -u "$sysroot")"; fi
+  bsdtar="$sysroot/System32/tar.exe"
+  if [[ -x "$bsdtar" ]]; then
+    "$bsdtar" -xf "$zip" -C "$dest"
+  elif command -v 7z >/dev/null 2>&1; then
+    7z x -y -o"$dest" "$zip" >/dev/null
+  else
+    echo "unzip_vendor: no zip extractor found (need System32 tar.exe/bsdtar or 7z)" >&2
+    return 1
+  fi
+}
+
+# vendor_root <extract_dir> [expected_subdir]: print the directory that holds bin/.
+# Some vendor zips nest everything under a single top-level dir (mysql/mariadb under
+# <name>-winx64/, EDB under pgsql/); others (the tporadowski Redis zip) are flat. We
+# locate the dir that actually contains a bin/ so callers don't hard-code layouts.
+vendor_root() {
+  local dir="$1" want="${2:-}"
+  if [[ -n "$want" && -d "$dir/$want/bin" ]]; then echo "$dir/$want"; return 0; fi
+  if [[ -d "$dir/bin" || -e "$dir/redis-server.exe" ]]; then echo "$dir"; return 0; fi
+  local d
+  for d in "$dir"/*/; do
+    [[ -d "${d}bin" || -e "${d}redis-server.exe" ]] && { echo "${d%/}"; return 0; }
+  done
+  echo "vendor_root: no bin/ found under '$dir'" >&2
+  return 1
+}
+
+# _vs_dir: print the VS install dir via vswhere (preinstalled on windows-latest). The
+# env var holding the x86 Program Files path has parens in its name (PROGRAMFILES(X86)),
+# which bash can't reference via ${...}, so we read it through `printenv` and fall back
+# to the canonical path.
+_vs_dir() {
+  local pfx86 vswhere p
+  pfx86="$(printenv 'ProgramFiles(x86)' 2>/dev/null | tr -d '\r')"
+  [[ -n "$pfx86" ]] && command -v cygpath >/dev/null 2>&1 && pfx86="$(cygpath -u "$pfx86")"
+  [[ -n "$pfx86" ]] || pfx86="/c/Program Files (x86)"
+  vswhere="$pfx86/Microsoft Visual Studio/Installer/vswhere.exe"
+  [[ -x "$vswhere" ]] || return 1
+  p="$("$vswhere" -latest -products '*' -property installationPath 2>/dev/null | tr -d '\r')"
+  [[ -n "$p" ]] || return 1
+  command -v cygpath >/dev/null 2>&1 && p="$(cygpath -u "$p")"
+  printf '%s\n' "$p"
+}
+
+# windows_bundle_runtime <stage>: copy the VC++ runtime redist DLLs into <stage>/bin so
+# the artifact runs on a clean Win10+ box that lacks the VC++ Redistributable. Bundle
+# only the DLLs that exist for the installed toolset (vcruntime140_1.dll/concrt140.dll
+# are newer-only). UCRT (ucrtbase/api-ms-win-*) ships with Windows 10+, so it is NOT
+# bundled. No-op off Windows.
+windows_bundle_runtime() {
+  local stage="$1" vs redist crtdir f
+  [[ "$(host_os)" == windows ]] || return 0
+  mkdir -p "$stage/bin"
+  # In CI, inability to bundle the runtime is a hard error (windows-latest always has VS):
+  # fail here with a clear message rather than letting the gate report it one step later as
+  # an "imports unbundled vcruntime140.dll". Best-effort (warn + continue) only locally.
+  local ci_fail=0; [[ -n "${GITHUB_ACTIONS:-}${CI:-}" ]] && ci_fail=1
+  vs="$(_vs_dir)" || { echo "windows_bundle_runtime: VS install not found (vswhere)" >&2; return "$ci_fail"; }
+  # Newest x64 CRT redist dir (…/VC/Redist/MSVC/<ver>/x64/Microsoft.VC*.CRT).
+  crtdir="$(ls -d "$vs"/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT 2>/dev/null | sort -V | tail -1)"
+  [[ -n "$crtdir" && -d "$crtdir" ]] || { echo "windows_bundle_runtime: no CRT redist dir under $vs" >&2; return "$ci_fail"; }
+  for f in vcruntime140.dll vcruntime140_1.dll msvcp140.dll msvcp140_1.dll msvcp140_2.dll concrt140.dll; do
+    [[ -e "$crtdir/$f" ]] && cp -f "$crtdir/$f" "$stage/bin/"
+  done
+  # Redistribution of these DLLs is licensed by the folder-level grant for VC\Redist
+  # (https://aka.ms/vs/17/redist.txt), not a per-file enumeration; they come straight from
+  # that folder. (On Build Tools the on-disk Redist.txt is just a pointer to that URL.)
+  echo ">> windows_bundle_runtime: from $crtdir (license: https://aka.ms/vs/17/redist.txt)"
+}
+
+# _dumpbin: print the absolute path to dumpbin.exe. Invoke it by that full path — Windows
+# loads dumpbin's sibling MSVC DLLs from its own directory automatically, so no PATH setup
+# is needed (and any export here would die with the command-substitution subshell anyway).
+_dumpbin() {
+  local vs binroot
+  vs="$(_vs_dir)" || return 1
+  binroot="$(ls -d "$vs"/VC/Tools/MSVC/*/bin/Hostx64/x64 2>/dev/null | sort -V | tail -1)"
+  [[ -n "$binroot" && -x "$binroot/dumpbin.exe" ]] || return 1
+  printf '%s\n' "$binroot/dumpbin.exe"
+}
+
+# windows_self_contain_gate <stage>: fail if any staged .exe imports a non-system DLL
+# that is not bundled in bin/. Analogue of macos_self_contain_gate — the smoke test runs
+# on a redist-equipped runner, so it proves "runs on a dev box," NOT self-containment.
+# MANDATORY in CI: if dumpbin can't be resolved while GITHUB_ACTIONS/CI is set, hard-fail
+# (dumpbin + vswhere are always present on windows-latest). Best-effort no-op only locally.
+windows_self_contain_gate() {
+  local stage="$1" db f dep base lc
+  [[ "$(host_os)" == windows ]] || return 0
+  db="$(_dumpbin)" || {
+    if [[ -n "${GITHUB_ACTIONS:-}${CI:-}" ]]; then
+      echo "windows_self_contain_gate: dumpbin not resolvable in CI (must be present on windows-latest)" >&2
+      return 1
+    fi
+    echo "windows_self_contain_gate: dumpbin unavailable; skipping (local best-effort)" >&2
+    return 0
+  }
+  shopt -s nocasematch
+  local rc=0 deps_out
+  while IFS= read -r f; do
+    deps_out="$("$db" -dependents "$f" 2>/dev/null | sed -n '/following dependencies/,/Summary/p')"
+    # Every PE has at least KERNEL32 — empty output means dumpbin failed or the binary is
+    # unreadable/locked. Don't let that vacuously "pass" the gate in CI.
+    if [[ -z "$deps_out" ]]; then
+      if [[ -n "${GITHUB_ACTIONS:-}${CI:-}" ]]; then
+        echo "windows_self_contain_gate: no dependency output for ${f#"$stage"/} (dumpbin failed?)" >&2
+        rc=1
+      fi
+      continue
+    fi
+    while IFS= read -r dep; do
+      dep="$(echo "$dep" | tr -d '\r' | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"
+      [[ "$dep" == *.dll ]] || continue   # nocasematch makes this match .DLL/.Dll too
+      base="${dep##*/}"
+      # OS DLLs shipped with Windows 10+. NOTE: msvcrt.dll (versionless) IS the OS C
+      # runtime, but the VC++ redist family (vcruntime140*/msvcp140*/concrt140*/msvcrNNN)
+      # is deliberately NOT here — it must be bundled, so it falls through to the
+      # bundled-in-bin/ check below (catches the "installed on the runner but not on a
+      # clean user box" case, the Windows analogue of the macOS-brew gate).
+      case "$base" in
+        kernel32.dll|kernelbase.dll|kernel.appcore.dll|ntdll.dll|advapi32.dll|sechost.dll|\
+        rpcrt4.dll|user32.dll|win32u.dll|gdi32.dll|gdi32full.dll|shell32.dll|shlwapi.dll|\
+        shcore.dll|ole32.dll|oleaut32.dll|combase.dll|comdlg32.dll|comctl32.dll|\
+        ws2_32.dll|wsock32.dll|mswsock.dll|dnsapi.dll|iphlpapi.dll|winhttp.dll|wininet.dll|\
+        secur32.dll|sspicli.dll|crypt32.dll|bcrypt.dll|bcryptprimitives.dll|ncrypt.dll|\
+        cryptbase.dll|cryptsp.dll|netapi32.dll|authz.dll|userenv.dll|version.dll|winmm.dll|\
+        psapi.dll|setupapi.dll|cfgmgr32.dll|powrprof.dll|profapi.dll|normaliz.dll|\
+        dbghelp.dll|dbgcore.dll|imagehlp.dll|msvcrt.dll|ucrtbase.dll|\
+        wldap32.dll|wtsapi32.dll|wintrust.dll|cabinet.dll|mpr.dll|samlib.dll|dsrole.dll|\
+        api-ms-win-*|ext-ms-*) continue ;;
+      esac
+      lc="$(echo "$base" | tr '[:upper:]' '[:lower:]')"
+      # Only bin/ counts: the Windows loader resolves an exe's import-table DLLs from the
+      # exe's own dir (bin/), system dirs, and PATH — NOT a sibling lib/. (lib/ DLLs are
+      # server-loaded plugins resolved by the engine itself, not import-table deps.)
+      if [[ -z "$(find "$stage/bin" -iname "$lc" -print -quit 2>/dev/null)" ]]; then
+        echo "windows_self_contain_gate: ${f#"$stage"/} imports unbundled '$base'" >&2
+        rc=1
+      fi
+    done <<< "$deps_out"
+  done < <(find "$stage/bin" -iname '*.exe' -type f)
+  shopt -u nocasematch
+  return "$rc"
+}
+
 # --- downloads -------------------------------------------------------------------
 
 # fetch_to <url> <out>: download url to out with retries. Fails loudly on HTTP errors.
@@ -401,4 +579,58 @@ mysql_generic_url() {
   done
   echo "mysql_generic_url: no MySQL generic tarball found for $up $os $arch" >&2
   return 1
+}
+
+# --- Windows vendor download URLs (x86_64 only) ----------------------------------
+# These resolve the official Windows binary archives we repackage. All use _url_ok HEAD
+# probes and fail loudly so a bad version aborts the leg instead of producing nothing.
+
+# mysql_win_url <upstream>: Oracle MySQL winx64 zip. Same cdn/dev base as the generic
+# tarball; asserts the EXACT mysql-<up>-winx64.zip (not the -winx64-debug-test sibling).
+mysql_win_url() {
+  local up="$1" majmin base url
+  majmin="$(printf '%s\n' "$up" | cut -d. -f1,2)"
+  for base in "https://cdn.mysql.com/Downloads/MySQL-${majmin}" \
+              "https://dev.mysql.com/get/Downloads/MySQL-${majmin}"; do
+    url="$base/mysql-${up}-winx64.zip"
+    if _url_ok "$url"; then echo "$url"; return 0; fi
+  done
+  echo "mysql_win_url: no MySQL winx64 zip found for $up" >&2
+  return 1
+}
+
+# mariadb_win_url <upstream>: MariaDB winx64 zip from archive.mariadb.org. EXACT filename
+# (the same dir also holds the much larger -winx64-debugsymbols.zip — never glob).
+mariadb_win_url() {
+  local up="$1" url
+  url="https://archive.mariadb.org/mariadb-${up}/winx64-packages/mariadb-${up}-winx64.zip"
+  _url_ok "$url" || { echo "mariadb_win_url: not found: $url" >&2; return 1; }
+  echo "$url"
+}
+
+# postgres_win_url <upstream> [buildno]: EDB PostgreSQL windows-x64 binaries zip. The
+# build-number suffix <N> isn't derivable from <up>; prefer an explicit buildno (from the
+# workflow's postgres_win_buildno input / POSTGRES_WIN_BUILDNO), else probe N highest-first.
+postgres_win_url() {
+  local up="$1" buildno="${2:-${POSTGRES_WIN_BUILDNO:-}}" n url
+  if [[ -n "$buildno" ]]; then
+    url="https://get.enterprisedb.com/postgresql/postgresql-${up}-${buildno}-windows-x64-binaries.zip"
+    _url_ok "$url" && { echo "$url"; return 0; }
+    echo "postgres_win_url: pinned buildno '$buildno' not found: $url" >&2
+    return 1
+  fi
+  for n in $(seq 25 -1 1); do
+    url="https://get.enterprisedb.com/postgresql/postgresql-${up}-${n}-windows-x64-binaries.zip"
+    if _url_ok "$url"; then echo "$url"; return 0; fi
+  done
+  echo "postgres_win_url: no EDB windows-x64 binaries zip found for $up (set postgres_win_buildno or supply a direct URL)" >&2
+  return 1
+}
+
+# redis_win_url <upstream>: native MSVC Redis-for-Windows port (tporadowski). pre-7.4 BSD.
+redis_win_url() {
+  local up="$1" url
+  url="https://github.com/tporadowski/redis/releases/download/v${up}/Redis-x64-${up}.zip"
+  _url_ok "$url" || { echo "redis_win_url: not found: $url" >&2; return 1; }
+  echo "$url"
 }
