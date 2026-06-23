@@ -32,6 +32,14 @@ on:
         type: string
         required: false
         default: ""
+      targets:
+        description: >-
+          which platform(s) to build (default all). Pick a single target to rebuild just
+          that platform — already-published platforms are untouched and the manifest merges.
+        type: choice
+        required: true
+        default: all
+        options: [all, linux-x86_64, linux-aarch64, macos-aarch64, windows-x86_64]
       redis_win_upstream:
         description: >-
           redis slot only — Windows ships the native MSVC Redis port (Valkey doesn't build
@@ -85,27 +93,44 @@ jobs:
         # The listing is now services.json; remove any leftover index.html.
         run: gh release delete-asset "$RELEASE_TAG" index.html --yes || true
 
+  # Compute the build matrix from the `targets` input so a single platform can be rebuilt
+  # without touching the others. The full set is the source of truth here; `targets=all`
+  # (default) yields every platform, otherwise just the one selected target.
+  #   macOS x86_64 is intentionally absent: GitHub retired the last Intel macOS image
+  #   (macos-13) in Dec 2025, and macos-14/15 are arm64-only.
+  #   Windows is x86_64-only: no service has a native Windows ARM64 upstream binary, and
+  #   Windows-on-ARM runs x64 via built-in emulation.
+  set-matrix:
+    if: ${{ inputs.action == 'build' }}
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        run: |
+          all='[{"runner":"ubuntu-latest","target":"linux-x86_64"},{"runner":"ubuntu-24.04-arm","target":"linux-aarch64"},{"runner":"macos-14","target":"macos-aarch64"},{"runner":"windows-latest","target":"windows-x86_64"}]'
+          if [[ "${{ inputs.targets }}" == "all" ]]; then
+            inc="$(jq -c '.' <<<"$all")"
+          else
+            inc="$(jq -c --arg t "${{ inputs.targets }}" '[.[] | select(.target == $t)]' <<<"$all")"
+          fi
+          [[ "$(jq 'length' <<<"$inc")" -ge 1 ]] \
+            || { echo "set-matrix: no platform matched targets='${{ inputs.targets }}'" >&2; exit 1; }
+          echo "selected targets: $inc"
+          echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: set-matrix
     if: ${{ inputs.action == 'build' }}
     # Run every build step under bash. Default on Linux/macOS already; on windows-latest
     # this selects Git Bash so the same scripts run. Scoped to this job, so the
-    # finalize/ensure-release jobs are untouched.
+    # set-matrix/finalize/ensure-release jobs are untouched.
     defaults:
       run:
         shell: bash
     strategy:
       fail-fast: false
-      matrix:
-        # macOS x86_64 is intentionally omitted: GitHub retired the last Intel
-        # macOS image (macos-13) in Dec 2025, and macos-14/15 are arm64-only.
-        # macOS ships arm64 binaries only.
-        # Windows is x86_64-only: no service has a native Windows ARM64 upstream
-        # binary, and Windows-on-ARM runs x64 via built-in emulation.
-        include:
-          - { runner: ubuntu-latest,    target: linux-x86_64 }
-          - { runner: ubuntu-24.04-arm, target: linux-aarch64 }
-          - { runner: macos-14,         target: macos-aarch64 }
-          - { runner: windows-latest,   target: windows-x86_64 }
+      matrix: ${{ fromJSON(needs.set-matrix.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
