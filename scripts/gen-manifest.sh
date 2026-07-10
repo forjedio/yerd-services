@@ -34,7 +34,7 @@ emit_triples() {
     arch="${base##*-}";  rest="${base%-*}";   [[ "$rest"  != "$base" ]] || continue
     os="${rest##*-}";    rest2="${rest%-*}";  [[ "$rest2" != "$rest" ]] || continue
     service="${rest2%%-*}"; version="${rest2#*-}"; [[ "$version" != "$rest2" ]] || continue
-    case "$os"      in linux|macos) ;;            *) continue ;; esac
+    case "$os"      in linux|macos|windows) ;;    *) continue ;; esac
     case "$arch"    in x86_64|aarch64) ;;         *) continue ;; esac
     case "$service" in redis|mysql|mariadb|postgres) ;; *) continue ;; esac
     printf '%s\t%s\t%s-%s\n' "$service" "$version" "$os" "$arch"
