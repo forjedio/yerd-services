@@ -99,7 +99,7 @@ if [[ "$OS" == windows ]]; then
       out="$("$bin/mysql.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot -N -e 'SELECT 1')"
       [[ "$out" == "1" ]] || { echo "mysql: SELECT 1 returned '$out'" >&2; exit 1; }
       "$bin/mysql.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot -e 'CREATE DATABASE bk; CREATE TABLE bk.t(id INT); INSERT INTO bk.t VALUES(42);'
-      "$bin/mysqldump.exe" --no-tablespaces --single-transaction --protocol=TCP -h 127.0.0.1 -P "$port" -uroot bk > "$extract/dump.sql"
+      "$bin/mysqldump.exe" --no-tablespaces --single-transaction --set-gtid-purged=OFF --protocol=TCP -h 127.0.0.1 -P "$port" -uroot bk > "$extract/dump.sql"
       "$bin/mysql.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot -e 'DROP DATABASE bk; CREATE DATABASE bk;'
       "$bin/mysql.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot bk < "$extract/dump.sql"
       rt="$("$bin/mysql.exe" --protocol=TCP -h 127.0.0.1 -P "$port" -uroot -N -e 'SELECT id FROM bk.t')"
