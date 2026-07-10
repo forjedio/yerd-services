@@ -140,11 +140,34 @@ jobs:
       - name: Build artifact for ${{ matrix.target }}
         run: |
           scripts/build-service.sh "${{ inputs.service }}" "${{ inputs.version }}" "${{ inputs.upstream }}"
-      - name: Smoke-test the artifact
-        # Extract the packed tarball to a throwaway dir, start the server, run SELECT 1.
-        # A failed healthcheck fails the leg → finalize skips → nothing publishes.
+      - name: De-mask geo libs before smoke (postgres full, unix only)
+        # The postgres `full` build apt/brew-installs GEOS/PROJ/GDAL; leaving them installed lets
+        # ld.so.cache / brew's dylib dir satisfy the artifact's deps, masking a broken bundle and
+        # turning smoke falsely green. Remove them so resolution comes ONLY from the bundle. NOT in
+        # smoke-test.sh (it runs on dev boxes). autoremove is essential — removing just the -dev
+        # packages leaves the auto-installed runtime .so packages (and the mask) behind.
+        if: ${{ inputs.service == 'postgres' && matrix.target != 'windows-x86_64' }}
         run: |
-          scripts/smoke-test.sh "${{ inputs.service }}" dist/*.tar.gz
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo apt-get remove -y libgeos-dev libproj-dev libgdal-dev >/dev/null 2>&1 || true
+            sudo apt-get autoremove -y >/dev/null 2>&1 || true
+            ! ldconfig -p | grep -qE 'libgdal|libproj\.|libgeos_c' \
+              || { echo "de-mask: system geo runtime libs still present" >&2; exit 1; }
+          else
+            brew uninstall --ignore-dependencies gdal proj geos >/dev/null 2>&1 || true
+            for f in gdal proj geos; do
+              brew list "$f" >/dev/null 2>&1 && { echo "de-mask: brew $f still present" >&2; exit 1; }
+            done
+          fi
+      - name: Smoke-test the artifact(s)
+        # Extract each packed tarball to a throwaway dir, start the server, run SELECT 1 (+ the
+        # extension/PostGIS checks). A failed healthcheck fails the leg → finalize skips → nothing
+        # publishes. Loop because a postgres build now emits TWO tarballs (base + `-full`), and
+        # smoke-test.sh takes exactly one at a time.
+        run: |
+          for t in dist/*.tar.gz; do
+            scripts/smoke-test.sh "${{ inputs.service }}" "$t"
+          done
       - name: Stage the one produced artifact for atomic publish
         # Emit it as a workflow artifact rather than uploading to the release, so a
         # partial-matrix failure never half-publishes to the live release.
@@ -195,13 +218,20 @@ jobs:
           source scripts/lib.sh
           svc="$(canonical_service "${{ inputs.service }}")"
           ver="${{ inputs.version }}"
+          # A single postgres `build` emits both `<ver>` and the `<ver>-full` variant, so remove
+          # must sweep both labels or it orphans the sibling. The extra labels are harmless no-ops
+          # (|| true) for services that don't produce them.
+          vers=("$ver")
+          [[ "$svc" == postgres ]] && vers+=("${ver}-full")
           # Sweep every possible os/arch combo. We don't publish macos-x86_64 or
           # windows-aarch64, but deleting them anyway is harmless (|| true) and cleans
           # any legacy asset.
-          for os in linux macos windows; do
-            for arch in x86_64 aarch64; do
-              name="$(artifact_filename "$svc" "$ver" "$os" "$arch")"
-              gh release delete-asset "$RELEASE_TAG" "$name" --yes || true
+          for v in "${vers[@]}"; do
+            for os in linux macos windows; do
+              for arch in x86_64 aarch64; do
+                name="$(artifact_filename "$svc" "$v" "$os" "$arch")"
+                gh release delete-asset "$RELEASE_TAG" "$name" --yes || true
+              done
             done
           done
 
