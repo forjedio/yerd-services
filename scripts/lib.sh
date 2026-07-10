@@ -165,11 +165,17 @@ macos_make_relocatable() {
 # staged Mach-O files INTO <stage>/lib so the tree is self-contained, looping to pick up
 # transitive external deps. Run BEFORE macos_make_relocatable (which then rewrites the
 # now-local refs to @rpath). The macOS analogue of linux_self_contain's ldd sweep. No-op off
-# macOS. (Libs that reference siblings via @loader_path are fine here because the binaries link
-# both directly, so both get copied.)
+# macOS.
+#
+# Two dep flavours are resolved: (a) ABSOLUTE package-manager paths (brew Cellar/opt, MacPorts),
+# and (b) @rpath/<lib> deps that resolve via the file's OWN LC_RPATH entries — brew libs like
+# libgeos_c reference their sibling (libgeos) by @rpath, and NOTHING links that sibling directly,
+# so the absolute-only sweep would miss it (the geo stack: GEOS/GDAL). The while-changed loop
+# makes both transitive.
 macos_bundle_external() {
-  local stage="$1" f dep base changed=1
+  local stage="$1" f dep base changed=1 rpdir cand brewpfx
   [[ "$(host_os)" == macos ]] || return 0
+  brewpfx="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
   mkdir -p "$stage/lib"
   while [[ "$changed" -eq 1 ]]; do
     changed=0
@@ -182,6 +188,31 @@ macos_bundle_external() {
             if [[ ! -e "$stage/lib/$base" ]]; then
               cp -L "$dep" "$stage/lib/$base" 2>/dev/null \
                 && { chmod u+w "$stage/lib/$base" 2>/dev/null; changed=1; }
+            fi
+            ;;
+          @rpath/*)
+            base="${dep##*/}"
+            if [[ ! -e "$stage/lib/$base" ]]; then
+              cand=""
+              # (a) Resolve against THIS file's LC_RPATH dirs (each may embed @loader_path).
+              while IFS= read -r rpdir; do
+                [[ -n "$rpdir" ]] || continue
+                rpdir="${rpdir//@loader_path/$(dirname "$f")}"
+                rpdir="${rpdir//@executable_path/$(dirname "$f")}"
+                [[ -e "$rpdir/${dep#@rpath/}" ]] && { cand="$rpdir/${dep#@rpath/}"; break; }
+              done < <(otool -l "$f" | awk '/ LC_RPATH$/{r=1;next} r&&/ path /{print $2;r=0}')
+              # (b) Fallback: brew libs like libgeos_c carry NO rpath of their own — the resolving
+              # rpath lives on the consumer. Search the brew tree for the basename.
+              if [[ -z "$cand" ]]; then
+                for rpdir in "$brewpfx/lib" /usr/local/lib; do
+                  [[ -e "$rpdir/$base" ]] && { cand="$rpdir/$base"; break; }
+                done
+                [[ -z "$cand" ]] && cand="$(find "$brewpfx/Cellar" "$brewpfx/opt" -name "$base" -print -quit 2>/dev/null || true)"
+              fi
+              if [[ -n "$cand" && -e "$cand" ]]; then
+                cp -L "$cand" "$stage/lib/$base" 2>/dev/null \
+                  && { chmod u+w "$stage/lib/$base" 2>/dev/null; changed=1; }
+              fi
             fi
             ;;
         esac
@@ -367,6 +398,120 @@ ensure_mariadb_runtime_deps() {
   for p in libsystemd-dev liblzma5 libzstd1 liblz4-1 libcap2 libgcrypt20; do
     apt_get install -y "$p" >/dev/null 2>&1 || true
   done
+}
+
+# ensure_postgis_deps: install the geo stack + the libs the `full` postgres configure needs
+# (OpenSSL/libxml/uuid/PCRE for pgcrypto/uuid-ossp/xml2/address_standardizer, and
+# GEOS/PROJ/GDAL/json-c/protobuf-c for PostGIS-with-raster), root-aware. Tolerant per package
+# (names vary across releases); the caller's configure/build fails loudly if something's absent.
+# On macOS, keg-only formulae (openssl@3, libxml2) are surfaced to configure via PKG_CONFIG_PATH
+# + the caller's --with-includes/--with-libraries; we do NOT install ossp-uuid (the full build
+# configures --with-uuid=e2fs, whose API macOS provides in the base system).
+ensure_postgis_deps() {
+  if [[ "$(host_os)" == linux ]]; then
+    command -v apt-get >/dev/null 2>&1 || { echo "ensure_postgis_deps: apt-get unavailable" >&2; return 1; }
+    apt_get update >/dev/null 2>&1 || true
+    # bison/flex: the full variant recompiles postgres (configure hard-requires them on PG17);
+    # xsltproc: PostGIS's build generates postgis_comments.sql via XSLT. These are preinstalled on
+    # GitHub runners but NOT on minimal images, so provision them for a self-sufficient build.
+    apt_get install -y \
+      pkg-config bison flex xsltproc libssl-dev uuid-dev libxml2-dev libpcre2-dev \
+      libgeos-dev libproj-dev libgdal-dev libjson-c-dev libprotobuf-c-dev protobuf-c-compiler \
+      >/dev/null 2>&1 || true
+    # Hard-require the load-bearing configs so a silent apt miss fails here, not mid-build.
+    command -v geos-config >/dev/null 2>&1 && command -v gdal-config >/dev/null 2>&1 && command -v proj >/dev/null 2>&1 \
+      || { echo "ensure_postgis_deps: geos/gdal/proj dev packages missing after apt" >&2; return 1; }
+  else
+    command -v brew >/dev/null 2>&1 || { echo "ensure_postgis_deps: brew unavailable" >&2; return 1; }
+    local f
+    for f in pkg-config openssl@3 libxml2 pcre2 geos proj gdal json-c protobuf-c; do
+      brew list "$f" >/dev/null 2>&1 || brew install "$f" >/dev/null 2>&1 || true
+    done
+    # Surface keg-only openssl@3 + libxml2 to pg_config/pkg-config-driven configure.
+    local ic
+    ic="$(brew --prefix openssl@3 2>/dev/null)/lib/pkgconfig:$(brew --prefix libxml2 2>/dev/null)/lib/pkgconfig"
+    PKG_CONFIG_PATH="${ic}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"; export PKG_CONFIG_PATH
+    command -v geos-config >/dev/null 2>&1 && command -v gdal-config >/dev/null 2>&1 \
+      || { echo "ensure_postgis_deps: geos/gdal missing after brew" >&2; return 1; }
+  fi
+}
+
+# postgis_win_url <pg_major> [postgis_ver]: the prebuilt, self-contained OSGeo PostGIS bundle
+# for the EDB PostgreSQL <pg_major> (carries its own GEOS/PROJ/GDAL/libxml DLLs + data). The
+# exact PostGIS version isn't derivable from the pg major; prefer POSTGIS_WIN_UPSTREAM, else fail
+# loudly (the OSGeo dir lists them but has no autoindex API here — pin it).
+postgis_win_url() {
+  local pgmaj="$1" pv="${2:-${POSTGIS_WIN_UPSTREAM:-}}" url
+  [[ -n "$pv" ]] || { echo "postgis_win_url: set POSTGIS_WIN_UPSTREAM to the bundle version (e.g. 3.5.3)" >&2; return 1; }
+  url="https://download.osgeo.org/postgis/windows/pg${pgmaj}/postgis-bundle-pg${pgmaj}-${pv}x64.zip"
+  _url_ok "$url" || { echo "postgis_win_url: not found: $url" >&2; return 1; }
+  echo "$url"
+}
+
+# _linux_core_lib_re: the shared allowlist of libs we deliberately DO NOT bundle — glibc core +
+# the C++/GCC runtime (ABI-tied to the host toolchain; bundling them causes more breakage than it
+# fixes). Kept in one place so the geo bundler and its gate agree with linux_self_contain.
+_linux_core_lib_re='libc\.so|libm\.so|libmvec|libpthread|libdl\.so|librt\.so|libresolv|ld-linux|linux-vdso|libstdc\+\+|libgcc_s'
+
+# linux_bundle_all <stage> <seed-relpath...>: bundle the FULL transitive shared-lib closure of the
+# seed ELF files into <stage>/lib so a relocated tree resolves everything with no host deps. For a
+# heavy chain (PostGIS -> GEOS/PROJ/GDAL -> curl/sqlite/tiff/...) where the modules live in
+# lib/postgresql/, this + linux_make_relocatable (which stamps $ORIGIN-relative RUNPATH on every
+# staged ELF, reaching lib/ from lib/postgresql/ via $ORIGIN/..) replaces linux_self_contain's
+# bin/-only lib/private scheme. ldd is transitive, so one pass per seed yields the whole closure.
+#
+# Collision policy (a distro libgdal drags its OWN libpq.so.5/libxml2 sharing sonames with the
+# source-built libs we already cp -R'd into lib/): for a dep whose dest already exists —
+#   (1) identical content            -> skip (debug);
+#   (2) staged copy is ours          -> keep ours, WARN (naming the shadowed system path);
+#   (3) differs and neither is ours  -> hard-fail.
+# Keep-first is an explicit -e test (NOT cp -n: coreutils 9.2-9.4 exit 1 on a skip -> set -e abort).
+linux_bundle_all() {
+  local stage="$1"; shift
+  [[ "$(host_os)" == linux ]] || return 0
+  mkdir -p "$stage/lib"
+  local seed dep dest base
+  for seed in "$@"; do
+    while IFS= read -r dep; do
+      [[ -n "$dep" && -e "$dep" ]] || continue
+      base="${dep##*/}"
+      echo "$base" | grep -Eq "$_linux_core_lib_re" && continue
+      dest="$stage/lib/$base"
+      if [[ -e "$dest" ]]; then
+        if cmp -s "$dep" "$dest"; then
+          :                                            # (1) identical — already bundled
+        elif [[ "$dep" == "$stage/"* || "$dep" == *"/pgi_full/"* ]]; then
+          :                                            # our own copy is the source — nothing to do
+        else
+          # dest exists, differs, and the incoming copy is a *system* lib -> ours wins (case 2).
+          echo "linux_bundle_all: keeping staged $base; not overwriting with system '$dep'" >&2
+        fi
+        continue
+      fi
+      cp -L "$dep" "$dest" 2>/dev/null && chmod u+w "$dest" 2>/dev/null || true
+    done < <(ldd "$stage/$seed" 2>/dev/null | awk '/=> \// {print $3}' | sort -u)
+  done
+}
+
+# linux_gate_all_elf <stage>: fail unless every non-core NEEDED lib of every ELF under bin/ AND
+# lib/ is bundled in <stage>/lib. The all-ELF scope (vs linux_self_contain's named-bins-only gate)
+# is what catches an unbundled transitive dep of a lib/postgresql/*.so — the failure the geo chain
+# would otherwise hide behind the build host's system libs.
+linux_gate_all_elf() {
+  local stage="$1" f need
+  [[ "$(host_os)" == linux ]] || return 0
+  command -v patchelf >/dev/null 2>&1 || { echo "linux_gate_all_elf: patchelf unavailable" >&2; return 1; }
+  local rc=0
+  while IFS= read -r f; do
+    file -b "$f" 2>/dev/null | grep -q '^ELF' || continue
+    while IFS= read -r need; do
+      [[ -z "$need" ]] && continue
+      echo "$need" | grep -Eq "$_linux_core_lib_re" && continue
+      find "$stage/lib" -name "$need" | grep -q . || {
+        echo "linux_gate_all_elf: '$need' (needed by ${f#"$stage"/}) is not bundled." >&2; rc=1; }
+    done < <(patchelf --print-needed "$f" 2>/dev/null)
+  done < <(find "$stage/bin" "$stage/lib" -type f 2>/dev/null)
+  return "$rc"
 }
 
 # --- Windows: extraction, runtime bundling, self-containment ---------------------

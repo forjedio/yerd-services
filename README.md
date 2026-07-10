@@ -154,7 +154,7 @@ the escape hatch is to move `SERVICES_BASE_URL` to a CDN while keeping this arti
 |---------|---------|-----------------|-----|-------|
 | `redis` | _(label)_ | [Valkey](https://github.com/valkey-io/valkey) tag `<upstream>` | build from source | `make -j BUILD_TLS=no` |
 | `mysql` | _(label)_ | [Oracle MySQL](https://dev.mysql.com/downloads/mysql/) generic tarball `<upstream>` (e.g. 8.4.9 LTS) | repackage | `bin/{mysqld,mysql,mysqld_safe,mysqldump}` + bundled `lib/`+`share/`; macOS dylib install-names made relocatable |
-| `postgres` | _(label)_ | [postgresql.org](https://ftp.postgresql.org/pub/source/) source `<upstream>` (e.g. 17.10) | build from source | `./configure --without-icu --without-readline --without-zlib --without-libxml` (no compressed `pg_dump`); macOS made relocatable |
+| `postgres` | _(label)_ | [postgresql.org](https://ftp.postgresql.org/pub/source/) source `<upstream>` (e.g. 17.10) | build from source | `./configure --without-icu --without-readline --without-zlib --without-libxml` (no compressed `pg_dump`); macOS made relocatable. Also bundles a curated set of contrib extensions + **pgvector** (`PGVECTOR_UPSTREAM`, default `v0.8.5`) — see [Bundled extensions](#bundled-extensions) |
 | `mariadb` | _(label)_ | [archive.mariadb.org](https://archive.mariadb.org/) `<upstream>` (e.g. 11.8.8 LTS) | repackage (linux-x86_64) / build from source (ARM Linux + macOS) | MariaDB ships only a `linux-systemd-x86_64` bintar; CMake build for the rest (`-DWITH_SSL=system`, heavy plugins trimmed). `bin/{mariadbd,mariadb,mariadb-install-db,my_print_defaults,mariadb-dump,…}` + `lib/`+`share/`; made relocatable + self-contained |
 
 **Windows (`windows-x86_64`)** — all repackaged from official vendor zips (no service has a
@@ -165,7 +165,7 @@ native Windows ARM64 build, so Windows is x86_64-only; Windows-on-ARM runs x64 v
 | `redis` | [tporadowski/redis](https://github.com/tporadowski/redis) `Redis-x64-<redis_win_upstream>.zip` (default `5.0.14.1`) | **native MSVC port of Redis (pre-7.4, BSD-3) — NOT Valkey** (valkey has no Windows build). Version is independent of the Valkey `<upstream>` (set via `redis_win_upstream`). Note the version skew: Windows redis is 5.x while Linux/macOS run Valkey 8/9.x. Ships real `redis-server.exe`/`redis-cli.exe` (plus the port's `EventLog.dll`, covered by the port's BSD-3 notice). redis-server.exe statically links Lua/hiredis/jemalloc/linenoise — their notices ship in `redis-windows-third-party-NOTICES.txt`. |
 | `mysql` | [Oracle MySQL](https://dev.mysql.com/downloads/mysql/) `mysql-<upstream>-winx64.zip` | repackage `bin/` (exes + sibling DLLs) + `share/` + `lib/plugin/`; no `mysqld_safe` |
 | `mariadb` | [archive.mariadb.org](https://archive.mariadb.org/) `mariadb-<upstream>-winx64.zip` | repackage `bin/` + `share/`; init tool `mariadb-install-db.exe`/`mysql_install_db.exe` |
-| `postgres` | [EDB](https://www.enterprisedb.com/download-postgresql-binaries) `postgresql-<upstream>-<N>-windows-x64-binaries.zip` | repackage `pgsql/{bin,lib,share}`; the build-number `<N>` is set via `postgres_win_buildno` (else probed) |
+| `postgres` | [EDB](https://www.enterprisedb.com/download-postgresql-binaries) `postgresql-<upstream>-<N>-windows-x64-binaries.zip` | repackage `pgsql/{bin,lib,share}`; the build-number `<N>` is set via `postgres_win_buildno` (else probed). The EDB zip already carries the contrib extensions (shipped via the verbatim `lib/`+`share/` copy); **pgvector is not bundled on Windows** — see [Bundled extensions](#bundled-extensions) |
 
 All Windows artifacts bundle the VC++ runtime DLLs into `bin/` and pass
 `windows_self_contain_gate` (a `dumpbin -dependents` check, mandatory in CI). The UCRT
@@ -173,6 +173,13 @@ All Windows artifacts bundle the VC++ runtime DLLs into `bin/` and pass
 used (its `cygwin1.dll` is GPLv3). Redistribution of the bundled VC++ runtime DLLs is
 covered by the folder-level grant for `VC\Redist` (https://aka.ms/vs/17/redist.txt), not a
 per-file enumeration.
+
+The **postgres `full`** variant (see [Variants](#variants)) additionally builds from:
+[PostGIS](https://postgis.net/) `POSTGIS_UPSTREAM` (default 3.6.0, GPLv2, with raster),
+[GEOS](https://libgeos.org/) (LGPL-2.1), [PROJ](https://proj.org/) (X/MIT),
+[GDAL](https://gdal.org/) (MIT) + json-c/protobuf-c — GEOS/PROJ/GDAL provisioned from the
+platform package manager (apt/brew) and bundled+relocated into the artifact; Windows overlays the
+prebuilt [OSGeo PostGIS bundle](https://download.osgeo.org/postgis/windows/) (`POSTGIS_WIN_UPSTREAM`).
 
 Each `(service, version)` is built per dispatch; the `<upstream>` actually used is whatever
 you pass. Every published artifact is **smoke-tested** on its native platform (start the
@@ -183,6 +190,66 @@ plain **"Redis"** (BSD-3) on Windows; **"MySQL (Oracle)"** (GPLv2, preserve noti
 MariaDB (GPLv2), PostgreSQL (permissive). Upstream license texts live in
 [`LICENSES/`](LICENSES/) (Windows redis carries `redis-BSD-3-Clause.txt` + the port's
 combined `redis-windows-port-BSD-3-Clause.txt`).
+
+## Bundled extensions
+
+The `postgres` artifact ships a curated set of PostgreSQL extensions so common dev workflows
+work out of the box (`CREATE EXTENSION <name>`), with no daemon or install changes — the
+extensions live under the `lib/`+`share/` trees the artifact already ships and are made
+relocatable with everything else.
+
+- **contrib (Linux/macOS, built from the same source tree):** `pg_stat_statements`, `pg_trgm`,
+  `citext`, `unaccent`, `hstore`, `ltree`, `btree_gin`, `btree_gist`, `fuzzystrmatch`,
+  `tablefunc`, `intarray`, `cube`, `earthdistance`, `postgres_fdw`, `dblink`, `pageinspect`,
+  `amcheck`, `pgstattuple`, `pg_buffercache`. All are core PostgreSQL License (covered by the
+  shipped `LICENSE`). On Windows these ride the EDB zip verbatim.
+- **pgvector (Linux/macOS only):** built out-of-tree against the same server, pinned to
+  `PGVECTOR_UPSTREAM` (default `v0.8.5`), compiled with `OPTFLAGS=""` so the CI-built `.so`
+  has no `-march=native` and runs on any CPU of the target arch. Ships its own notice as
+  `LICENSE-pgvector`. Not bundled on Windows (absent from the EDB zip; a native MSVC build is
+  a separate effort).
+
+Not in the lean base (they need OpenSSL/libxml/uuid or heavy GPL deps): `pgcrypto`, `uuid-ossp`,
+`sslinfo`, `xml2`, and **PostGIS** — these ship in the **`full` variant** instead (see below).
+Every build **smoke-tests** each bundled extension by creating it and calling a function (forcing
+the `.so` to load post-relocation) before publishing.
+
+## Variants
+
+Some builds ship in more than one flavour. A variant is a **label suffix**:
+`<version>-<variant>` (e.g. `17-full`), which the daemon treats as an ordinary opaque version —
+`yerd service install postgres 17-full`. No daemon awareness or Yerd release is needed for the
+label/install path; it rides the existing "filenames are the source of truth" design.
+
+**Convention:** always `<version>-<variant>`, `variant` ∈ lowercase `[a-z0-9]+`. The base (no
+suffix) is the lean, 100%-permissive default. Reserved variant names:
+
+| variant | service | contents | license |
+|---------|---------|----------|---------|
+| _(none)_ | all | lean base (permissive) | per-service base |
+| `full` | `postgres` | base + pgvector (unix) + **PostGIS w/ raster** + all now-buildable contrib (`pgcrypto`, `uuid-ossp`, `sslinfo`, `xml2`) | **GPLv2** (PostGIS) + LGPL-2.1 (GEOS) + permissive |
+
+One `service=postgres` dispatch builds **both** `postgres-<ver>` and `postgres-<ver>-full`.
+`action=remove version=<ver>` removes both. Key properties:
+
+- **GPL is confined to `full`.** The default `postgres` artifact stays 100% PostgreSQL License;
+  only `full` carries GPLv2 (PostGIS) / LGPL-2.1 (GEOS). PostgreSQL core is unaffected (PostGIS is
+  a runtime-loaded module + mere aggregation in the tarball); each component's notice ships inside
+  the `full` tarball (`LICENSE-postgis`, `LICENSE-geos`, `LICENSE-proj`, `LICENSE-gdal`, …).
+- **Datadirs are isolated.** `17` and `17-full` are distinct labels → distinct installs + datadirs.
+  A datadir with PostGIS objects can only be opened by the `full` build; base→full is safe (full is
+  a superset), full→base is not once PostGIS is used. Do not point one variant's binaries at the
+  other's datadir.
+- **Runtime data (PostGIS reprojection/raster):** the `full` artifact bundles PROJ's `proj.db` +
+  GDAL data under `share/`, but PROJ/GDAL locate them via `PROJ_DATA`/`GDAL_DATA`. The launcher
+  (yerd daemon) must export those for `full` installs — a **prerequisite for publishing `full`**
+  (the label/install path needs no daemon change; reprojection/raster runtime does). The build's
+  smoke test exports them at the bundled dirs and runs `ST_Transform`, so it validates the exact
+  bundle+env the daemon will use.
+- **Windows `full`** overlays the prebuilt OSGeo PostGIS bundle onto the EDB tree (pin
+  `POSTGIS_WIN_UPSTREAM`); it has no pgvector (absent upstream). Unix `full` is source-built
+  (`POSTGIS_UPSTREAM` default `3.6.0`, GEOS/PROJ/GDAL from the platform package manager, the whole
+  geo chain bundled + relocated + gated).
 
 ## Repo layout
 
@@ -196,7 +263,14 @@ yerd-services/
 │   ├── redis-windows-third-party-NOTICES.txt  # Lua/hiredis/jemalloc/linenoise (linked deps)
 │   ├── mysql-GPLv2.txt
 │   ├── postgresql-PostgreSQL-License.txt
-│   └── mariadb-GPLv2.txt
+│   ├── pgvector-PostgreSQL-License.txt  # bundled with postgres on Linux/macOS
+│   ├── mariadb-GPLv2.txt
+│   ├── postgis-GPLv2.txt               # postgres `full` variant (GPLv2)
+│   ├── geos-LGPL-2.1.txt               #   "   (LGPL-2.1)
+│   ├── proj-X11.txt                    #   "   (X/MIT)
+│   ├── gdal-MIT.txt                    #   "   (MIT)
+│   ├── json-c-MIT.txt                  #   "   (MIT)
+│   └── protobuf-c-BSD-2-Clause.txt     #   "   (BSD-2)
 ├── scripts/
 │   ├── lib.sh                      # os/arch tokens, canonical_service, artifact_filename, pack_stage, macos_make_relocatable, …
 │   ├── build-service.sh            # build/repackage ONE (service,version,upstream) for the host platform

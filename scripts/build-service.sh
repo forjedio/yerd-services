@@ -33,8 +33,9 @@ dist="$repo_root/dist"
 out="$dist/$(artifact_filename "$service" "$version" "$OS" "$ARCH")"
 
 stage="$(make_stage)"
+stage_full=""   # second stage for the postgres `full` variant (built after the base); may stay unset
 work="$(mktemp -d "${TMPDIR:-/tmp}/yerd-build.XXXXXX")"
-trap 'rm -rf "$stage" "$work"' EXIT
+trap 'rm -rf "$stage" "${stage_full:-}" "$work"' EXIT
 
 echo ">> building service=$service version=$version upstream=$upstream os=$OS arch=$ARCH"
 
@@ -57,6 +58,155 @@ win_stage_bin() {
   # *-debug.dll for abseil/protobuf) — never imported by the staged exes, just dead weight.
   rm -f "$stage"/bin/*-debug.dll 2>/dev/null || true
   return 0
+}
+
+# build_postgres_full <stage_full> <out_full>: build the PostGIS-bearing `full` variant into its
+# own stage and pack it, GPL-encumbered and confined to this artifact (the base stays permissive).
+# Unix: a SECOND from-source postgres (--with-libxml/ssl/uuid, so pgcrypto/uuid-ossp/sslinfo/xml2
+# become buildable) + pgvector + PostGIS-with-raster, with the whole geo chain bundled+relocated.
+# Windows: repackage the EDB tree again and overlay the self-contained OSGeo PostGIS bundle.
+# Uses script globals: work, repo_root, OS, version, upstream.
+build_postgres_full() {
+  local sf="$1" of="$2"
+  local jobs; jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+  local pgi="$work/pgi_full"
+
+  if [[ "$OS" == windows ]]; then
+    # Reuse the EDB tree extracted by the base windows branch ($work/pg -> pgsql/).
+    local root; root="$(vendor_root "$work/pg" "pgsql")"
+    win_stage_bin "$root" "$sf" postgres.exe initdb.exe pg_ctl.exe psql.exe \
+      createdb.exe pg_dump.exe pg_dumpall.exe pg_restore.exe
+    cp -R "$root/share" "$sf/share"
+    cp -R "$root/lib" "$sf/lib"
+    # Overlay the prebuilt, self-contained OSGeo PostGIS bundle (its own GEOS/PROJ/GDAL/libxml
+    # DLLs + data) onto the EDB tree. Its bin/ DLLs must sit next to the exes (Windows loader).
+    local pgmaj; pgmaj="$(printf '%s\n' "$upstream" | cut -d. -f1)"
+    local burl; burl="$(postgis_win_url "$pgmaj")" || { echo "postgres(full,windows): no PostGIS bundle" >&2; return 1; }
+    echo ">> postgis(windows) bundle: $burl"
+    fetch_to "$burl" "$work/postgis-win.zip"
+    unzip_vendor "$work/postgis-win.zip" "$work/pgis"
+    local broot; broot="$(vendor_root "$work/pgis")"
+    cp -R "$broot"/bin/.   "$sf/bin/"   2>/dev/null || true
+    cp -R "$broot"/lib/.   "$sf/lib/"   2>/dev/null || true
+    cp -R "$broot"/share/. "$sf/share/" 2>/dev/null || true
+    windows_bundle_runtime "$sf"
+    # windows_self_contain_gate scans only bin/*.exe (not the overlaid lib/ DLLs) — the geo-less
+    # Windows runner's `CREATE EXTENSION postgis` smoke is the real load test for the overlay.
+    windows_self_contain_gate "$sf"
+    [[ -n "$(find "$sf/share" -name 'postgis.control' -print -quit)" ]] \
+      || { echo "postgres(full,windows): postgis.control missing after overlay" >&2; return 1; }
+  else
+    # ---- Unix: second from-source postgres with the geo/crypto flags on ----
+    ensure_postgis_deps || { echo "postgres(full): geo/build deps unavailable" >&2; return 1; }
+    rm -rf "$work/pg_full"; mkdir -p "$work/pg_full"
+    tar xf "$work/pg.tar.gz" -C "$work/pg_full" --strip-components 1   # already fetched by base
+    local cfg=(--prefix="$pgi" --with-libxml --with-uuid=e2fs --with-ssl=openssl
+               --without-icu --without-readline --without-zlib)
+    if [[ "$OS" == macos ]]; then
+      local ossl; ossl="$(brew --prefix openssl@3 2>/dev/null)"
+      [[ -n "$ossl" ]] && cfg+=(--with-includes="$ossl/include" --with-libraries="$ossl/lib")
+    fi
+    ( cd "$work/pg_full" && ./configure "${cfg[@]}" )
+    make -C "$work/pg_full" -j"$jobs"
+    make -C "$work/pg_full" install-strip
+    # All buildable contrib (the base set + the four the flags above unblock).
+    local ce=(pg_stat_statements pg_trgm citext unaccent hstore ltree btree_gin btree_gist
+              fuzzystrmatch tablefunc intarray cube earthdistance postgres_fdw dblink pageinspect
+              amcheck pgstattuple pg_buffercache pgcrypto sslinfo xml2 uuid-ossp)
+    local c
+    for c in "${ce[@]}"; do
+      make -C "$work/pg_full/contrib/$c" -j"$jobs"
+      make -C "$work/pg_full/contrib/$c" install-strip
+    done
+    # pgvector (fresh extract; OPTFLAGS="" to strip -march=native for portability).
+    local pgvector_ver="${PGVECTOR_UPSTREAM:-v0.8.5}"
+    rm -rf "$work/pgvector_full"; mkdir -p "$work/pgvector_full"
+    tar xf "$work/pgvector.tar.gz" -C "$work/pgvector_full" --strip-components 1   # fetched by base
+    make -C "$work/pgvector_full" PG_CONFIG="$pgi/bin/pg_config" OPTFLAGS="" -j"$jobs"
+    make -C "$work/pgvector_full" PG_CONFIG="$pgi/bin/pg_config" OPTFLAGS="" install-strip
+    # PostGIS (with raster, on by default in 3.x) against the pg we just built.
+    local postgis_ver="${POSTGIS_UPSTREAM:-3.6.0}"
+    fetch_to "https://download.osgeo.org/postgis/source/postgis-${postgis_ver}.tar.gz" \
+      "$work/postgis.tar.gz"
+    rm -rf "$work/postgis"; mkdir -p "$work/postgis"
+    tar xf "$work/postgis.tar.gz" -C "$work/postgis" --strip-components 1
+    # --prefix=$pgi so PostGIS's autoconf @bindir@ (used by the topology module's macOS
+    # -bundle_loader) points at OUR postgres, not the /usr/local/bin default (the main module
+    # already uses pg_config --bindir; topology uses @bindir@ — they must agree). Extensions still
+    # install into the pg tree via pg_config, independent of --prefix. --without-sfcgal keeps the
+    # dep set deterministic (else configure opportunistically links a preinstalled brew SFCGAL,
+    # an unplanned LGPL/GPL dep absent on clean CI runners).
+    # PostGIS raster assumes certain system headers are transitively included, which strict/newer
+    # toolchains no longer guarantee — different platforms expose different gaps. Force-include the
+    # small set: <sys/param.h> for MIN/MAX (macOS beta SDK) and <sys/stat.h> for `struct stat`,
+    # which GDAL's cpl_vsi.h typedefs as VSIStatBufL without including it (ubuntu's GDAL → rt_band.c
+    # "storage size unknown"). Both are macro/type guarded, so harmless on the platform that already
+    # had them. -Wno-error demotions catch any other implicit decls on very new clang. autoconf
+    # carries CFLAGS into every module compile; keep -O2 since we override autoconf's default.
+    # _GNU_SOURCE/_LARGEFILE64_SOURCE expose glibc's `struct stat64`, which GDAL typedefs as
+    # VSIStatBufL (used by PostGIS raster rt_band.c); without them modern glibc hides it →
+    # "storage size unknown". No-ops on macOS.
+    ( cd "$work/postgis" \
+        && CFLAGS="${CFLAGS:-} -O2 -D_GNU_SOURCE -D_LARGEFILE64_SOURCE -include sys/param.h -include sys/stat.h -Wno-error=implicit-function-declaration -Wno-error=implicit-int" \
+           ./configure --prefix="$pgi" --with-pgconfig="$pgi/bin/pg_config" --without-sfcgal )
+    make -C "$work/postgis" -j"$jobs"
+    make -C "$work/postgis" install
+    # Stage the whole install tree.
+    cp -R "$pgi/lib" "$sf/lib"
+    cp -R "$pgi/share" "$sf/share"
+    mkdir -p "$sf/bin"
+    cp "$pgi/bin/postgres" "$pgi/bin/initdb" "$pgi/bin/pg_ctl" "$pgi/bin/psql" "$pgi/bin/createdb" \
+       "$pgi/bin/pg_dump" "$pgi/bin/pg_dumpall" "$pgi/bin/pg_restore" "$sf/bin/"
+    # Bundle PROJ + GDAL runtime data under share/ (the daemon exports PROJ_DATA/GDAL_DATA at it).
+    local projdb gdaldata
+    projdb="$(find /usr/share /usr/local/share "$(brew --prefix proj 2>/dev/null)/share" -name proj.db -print -quit 2>/dev/null || true)"
+    # Bundle ONLY proj.db (the CRS db + standard transforms, ~10MB). NOT the full proj-data grid
+    # set (per-country datum .tif grids, 20-77MB each → ~770MB) — those are optional high-accuracy
+    # datum shifts, unneeded for standard reprojection and network-fetchable on demand. Copy the
+    # small non-grid metadata too, but skip anything grid-sized.
+    if [[ -n "$projdb" ]]; then
+      mkdir -p "$sf/share/proj"
+      cp "$projdb" "$sf/share/proj/"
+      find "$(dirname "$projdb")" -maxdepth 1 -type f ! -name '*.tif' -size -1M \
+        -exec cp {} "$sf/share/proj/" \; 2>/dev/null || true
+    fi
+    gdaldata="$(gdal-config --datadir 2>/dev/null || true)"
+    [[ -n "$gdaldata" && -d "$gdaldata" ]] && { mkdir -p "$sf/share/gdal"; cp -R "$gdaldata"/. "$sf/share/gdal/"; }
+    # Self-contain + relocate the WHOLE stage (the geo chain lives in lib/ + lib/postgresql/).
+    if [[ "$OS" == macos ]]; then
+      macos_bundle_external "$sf"; macos_make_relocatable "$sf"; macos_self_contain_gate "$sf"
+    else
+      # Seeds = the server + every extension module; ldd of each yields the full transitive chain.
+      local -a seeds=(bin/postgres) so
+      while IFS= read -r so; do [[ -n "$so" ]] && seeds+=("$so"); done \
+        < <(cd "$sf" && find lib/postgresql -maxdepth 1 -name '*.so' 2>/dev/null)
+      linux_bundle_all "$sf" "${seeds[@]}"
+      linux_make_relocatable "$sf"
+      linux_gate_all_elf "$sf"
+    fi
+    # Presence asserts — the extensions + data actually made it into the tree.
+    local x
+    for x in postgis postgis_raster pgcrypto uuid-ossp vector; do
+      [[ -n "$(find "$sf/share" -name "$x.control" -print -quit)" ]] \
+        || { echo "postgres(full): $x.control missing" >&2; return 1; }
+    done
+    [[ -n "$(find "$sf/share" -name proj.db -print -quit)" ]] \
+      || { echo "postgres(full): proj.db not bundled" >&2; return 1; }
+  fi
+
+  # License staging: base PostgreSQL + pgvector (unix) + the GPL/LGPL/permissive geo notices.
+  # Map is "<src-basename> <artifact-notice-name>" so json-c/protobuf-c keep their real names.
+  cp "$repo_root/LICENSES/postgresql-PostgreSQL-License.txt" "$sf/LICENSE"
+  [[ "$OS" != windows ]] && cp "$repo_root/LICENSES/pgvector-PostgreSQL-License.txt" "$sf/LICENSE-pgvector"
+  local pair src dst
+  for pair in "postgis-GPLv2:postgis" "geos-LGPL-2.1:geos" "proj-X11:proj" \
+              "gdal-MIT:gdal" "json-c-MIT:json-c" "protobuf-c-BSD-2-Clause:protobuf-c"; do
+    src="${pair%%:*}"; dst="${pair##*:}"
+    [[ -f "$repo_root/LICENSES/$src.txt" ]] || { echo "postgres(full): missing LICENSES/$src.txt" >&2; return 1; }
+    cp "$repo_root/LICENSES/$src.txt" "$sf/LICENSE-$dst"
+  done
+
+  pack_stage "$sf" "$of"
 }
 
 if [[ "$OS" == windows ]]; then
@@ -212,6 +362,32 @@ case "$service" in
         --without-icu --without-readline --without-zlib --without-libxml )
     make -C "$work/pg" -j"$jobs"
     make -C "$work/pg" install-strip   # strip symbols (esp. large on Linux)
+    # Bundle a curated set of dependency-free contrib extensions. Built in-tree (each subdir
+    # inherits src/Makefile.global -> --prefix=$work/pgi), so install-strip lands the .so under
+    # $work/pgi/lib/postgresql and the control/SQL under $work/pgi/share/postgresql/extension —
+    # both swept into the stage by the cp -R below and made relocatable with the rest of the tree.
+    # Excluded on purpose (need flags/libs we don't configure): pgcrypto/sslinfo (OpenSSL — PG14+
+    # dropped pgcrypto's built-in crypto), xml2 (libxml), uuid-ossp (--with-uuid), the pl* companions.
+    contrib_exts=(
+      pg_stat_statements pg_trgm citext unaccent hstore ltree
+      btree_gin btree_gist fuzzystrmatch tablefunc intarray cube earthdistance
+      postgres_fdw dblink pageinspect amcheck pgstattuple pg_buffercache
+    )
+    for c in "${contrib_exts[@]}"; do
+      make -C "$work/pg/contrib/$c" -j"$jobs"
+      make -C "$work/pg/contrib/$c" install-strip
+    done
+    # Bundle pgvector (out-of-tree PGXS build against the pg we just built). OPTFLAGS="" strips
+    # pgvector's default -march=native so the CI-built .so runs on any CPU of the target arch
+    # (it's shipped to arbitrary user machines, not just the builder). install-strip is defined
+    # unconditionally in Makefile.global, so it works for this PGXS build too.
+    pgvector_ver="${PGVECTOR_UPSTREAM:-v0.8.5}"
+    fetch_to "https://github.com/pgvector/pgvector/archive/refs/tags/${pgvector_ver}.tar.gz" \
+      "$work/pgvector.tar.gz"
+    mkdir -p "$work/pgvector"
+    tar xf "$work/pgvector.tar.gz" -C "$work/pgvector" --strip-components 1
+    make -C "$work/pgvector" PG_CONFIG="$work/pgi/bin/pg_config" OPTFLAGS="" -j"$jobs"
+    make -C "$work/pgvector" PG_CONFIG="$work/pgi/bin/pg_config" OPTFLAGS="" install-strip
     cp "$work/pgi/bin/postgres" "$work/pgi/bin/initdb" "$work/pgi/bin/pg_ctl" \
        "$work/pgi/bin/psql" "$work/pgi/bin/createdb" \
        "$work/pgi/bin/pg_dump" "$work/pgi/bin/pg_dumpall" "$work/pgi/bin/pg_restore" "$stage/bin/"
@@ -226,6 +402,12 @@ case "$service" in
     [[ -f "$stage/share/postgresql/postgres.bki" ]] || { echo "postgres: share/postgresql/postgres.bki missing" >&2; exit 1; }
     ls "$stage"/share/postgresql/*.sample >/dev/null 2>&1 \
       || { echo "postgres: no *.sample configs in share/postgresql/" >&2; exit 1; }
+    # Extensions must have actually installed into the staged tree (a silently-empty install
+    # would otherwise only surface in the smoke stage). Check one contrib + pgvector control file.
+    [[ -f "$stage/share/postgresql/extension/pg_trgm.control" ]] \
+      || { echo "postgres: contrib not installed (pg_trgm.control missing)" >&2; exit 1; }
+    [[ -f "$stage/share/postgresql/extension/vector.control" ]] \
+      || { echo "postgres: pgvector not installed (vector.control missing)" >&2; exit 1; }
     # PG bakes absolute lib paths into the binaries (macOS install names / Linux rpath);
     # rewrite them relative to the executable so the unpacked tree relocates.
     case "$OS" in
@@ -348,7 +530,27 @@ else
     [[ -f "$repo_root/LICENSES/$lic" ]] || { echo "missing LICENSES/$lic" >&2; exit 1; }
     cp "$repo_root/LICENSES/$lic" "$stage/LICENSE"
   fi
+  # postgres (unix source build) additionally bundles pgvector, a separately-copyrighted
+  # component -> ship its own notice. (Windows postgres repackages the EDB zip, which does not
+  # include pgvector, so no pgvector notice there.)
+  if [[ "$service" == postgres && "$OS" != windows ]]; then
+    pgv_lic="$repo_root/LICENSES/pgvector-PostgreSQL-License.txt"
+    [[ -f "$pgv_lic" ]] || { echo "missing LICENSES/pgvector-PostgreSQL-License.txt" >&2; exit 1; }
+    cp "$pgv_lic" "$stage/LICENSE-pgvector"
+  fi
 fi
 
 pack_stage "$stage" "$out"
 echo ">> wrote $out"
+
+# postgres builds BOTH the lean base (above) and the PostGIS-bearing `full` variant, shipped as a
+# `<version>-full` label (the daemon treats the whole middle segment as an opaque version). The
+# base is already packed; build+pack the second artifact into its own stage. A full-build failure
+# aborts the leg (atomic publish) so nothing half-ships.
+if [[ "$service" == postgres ]]; then
+  stage_full="$(make_stage)"
+  out_full="$dist/$(artifact_filename postgres "${version}-full" "$OS" "$ARCH")"
+  echo ">> building postgres full variant -> $(basename "$out_full")"
+  build_postgres_full "$stage_full" "$out_full"
+  echo ">> wrote $out_full"
+fi

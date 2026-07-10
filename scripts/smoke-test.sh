@@ -132,12 +132,46 @@ if [[ "$OS" == windows ]]; then
       ;;
 
     postgres)
+      # `full` variant? Point PROJ/GDAL at the OSGeo bundle's data (under share/contrib/…) BEFORE
+      # the server starts — probe rather than hardcode. (No system geo stack on the Windows runner,
+      # so this smoke IS the genuine load-test for the overlaid PostGIS/geo DLLs.)
+      pg_full=""
+      if [[ -n "$(find "$extract/share" -name postgis.control -print -quit)" ]]; then
+        pg_full=1
+        pdb="$(find "$extract" -name proj.db -print -quit)"
+        [[ -n "$pdb" ]] && { PROJ_DATA="$(dirname "$pdb")"; export PROJ_DATA; }
+        gdd="$(find "$extract" -name gdalvrt.xsd -print -quit)"
+        [[ -n "$gdd" ]] && { GDAL_DATA="$(dirname "$gdd")"; export GDAL_DATA; }
+      fi
       # initdb/postgres auto-drop the runner's admin token on Windows; pg_ctl is the path
       # that performs the de-elevation. -A trust covers local + host(127.0.0.1) auth.
       "$bin/initdb.exe" -A trust -U postgres --locale=C -D "$data" >/dev/null
       "$bin/pg_ctl.exe" -D "$data" -o "-p $port" -w -t 60 start
       out="$("$bin/psql.exe" -h 127.0.0.1 -p "$port" -U postgres -tAc 'SELECT 1')"
       [[ "$out" == "1" ]] || { echo "postgres: SELECT 1 returned '$out'" >&2; exit 1; }
+      # extensions: EDB's zip already bundles contrib (shipped via cp -R lib/share), so verify
+      # they load. No pgvector on Windows (not in the EDB zip). postgres_fdw/dblink dlopen libpq.
+      "$bin/psql.exe" -h 127.0.0.1 -p "$port" -U postgres -d postgres -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;      SELECT similarity('cat','cats');
+CREATE EXTENSION IF NOT EXISTS citext;       SELECT 'AbC'::citext = 'abc'::citext;
+CREATE EXTENSION IF NOT EXISTS hstore;       SELECT ('a=>1'::hstore)->'a';
+CREATE EXTENSION IF NOT EXISTS unaccent;     SELECT unaccent('effect');
+CREATE EXTENSION IF NOT EXISTS ltree;        SELECT 'a.b.c'::ltree;
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+CREATE EXTENSION IF NOT EXISTS dblink;
+SQL
+      # full variant: verify the overlaid PostGIS/geo DLLs load + find their bundled data.
+      if [[ -n "$pg_full" ]]; then
+        "$bin/psql.exe" -h 127.0.0.1 -p "$port" -U postgres -d postgres -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE EXTENSION postgis;         SELECT postgis_full_version();
+SELECT ST_AsText(ST_Transform(ST_SetSRID(ST_MakePoint(0,0),4326),3857));
+CREATE EXTENSION postgis_raster;
+SELECT ST_SRID(ST_Transform(ST_SetSRID(ST_AddBand(ST_MakeEmptyRaster(2,2,0,0,1),'8BUI'),4326),3857));
+CREATE EXTENSION pgcrypto;        SELECT digest('x','sha256');
+CREATE EXTENSION "uuid-ossp";     SELECT uuid_generate_v4();
+SQL
+      fi
       "$bin/createdb.exe" -h 127.0.0.1 -p "$port" -U postgres bk
       "$bin/psql.exe" -h 127.0.0.1 -p "$port" -U postgres -d bk -c 'CREATE TABLE t(id int); INSERT INTO t VALUES(42);' >/dev/null
       "$bin/pg_dump.exe" -Fc -h 127.0.0.1 -p "$port" -U postgres bk -f "$extract/d.dump"
@@ -218,12 +252,51 @@ case "$service" in
     ;;
 
   postgres)
+    # `full` variant (bundles PostGIS)? Point PROJ/GDAL at the bundled data BEFORE the server
+    # starts — libproj/gdal read the POSTMASTER's environment, so this must precede pg_ctl start.
+    # (This simulates the yerd daemon, which exports these for full installs; probe rather than
+    # hardcode, since unix nests under share/proj while the Windows OSGeo bundle differs.)
+    pg_full=""
+    if [[ -n "$(find "$extract/share" -name postgis.control -print -quit)" ]]; then
+      pg_full=1
+      pdb="$(find "$extract" -name proj.db -print -quit)"
+      [[ -n "$pdb" ]] && { PROJ_DATA="$(dirname "$pdb")"; export PROJ_DATA; }
+      gdd="$(find "$extract" -name gdalvrt.xsd -print -quit)"
+      [[ -n "$gdd" ]] && { GDAL_DATA="$(dirname "$gdd")"; export GDAL_DATA; }
+    fi
     "$bin/initdb" -A trust -U postgres --locale=C -D "$data" >/dev/null
     # -k sets the socket DIRECTORY; psql -h must be that same directory; -p must match the
     # server's port on every connecting call.
     "$bin/pg_ctl" -D "$data" -o "-k $sockdir -p $port" -w -t 60 start
     out="$("$bin/psql" -h "$sockdir" -p "$port" -U postgres -tAc 'SELECT 1')"
     [[ "$out" == "1" ]] || { echo "postgres: SELECT 1 returned '$out'" >&2; exit 1; }
+    # extensions: create + exercise one function each to force the .so to dlopen — proves the
+    # bundled module actually relocated, not just that its control file shipped. postgres_fdw and
+    # dblink dlopen the bundled libpq; pg_stat_statements is CREATE-only (querying its view would
+    # need shared_preload_libraries). ON_ERROR_STOP=1 + set -e fails the leg on any error.
+    "$bin/psql" -h "$sockdir" -p "$port" -U postgres -d postgres -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;      SELECT similarity('cat','cats');
+CREATE EXTENSION IF NOT EXISTS citext;       SELECT 'AbC'::citext = 'abc'::citext;
+CREATE EXTENSION IF NOT EXISTS hstore;       SELECT ('a=>1'::hstore)->'a';
+CREATE EXTENSION IF NOT EXISTS unaccent;     SELECT unaccent('effect');
+CREATE EXTENSION IF NOT EXISTS ltree;        SELECT 'a.b.c'::ltree;
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+CREATE EXTENSION IF NOT EXISTS dblink;
+CREATE EXTENSION IF NOT EXISTS vector;       SELECT '[1,2,3]'::vector;
+SQL
+    # full variant: prove the GPL geo stack loads AND finds its bundled data post-relocation.
+    # ST_Transform reads PROJ's proj.db; postgis_raster + a raster reprojection exercises GDAL.
+    if [[ -n "$pg_full" ]]; then
+      "$bin/psql" -h "$sockdir" -p "$port" -U postgres -d postgres -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE EXTENSION postgis;         SELECT postgis_full_version();
+SELECT ST_AsText(ST_Transform(ST_SetSRID(ST_MakePoint(0,0),4326),3857));
+CREATE EXTENSION postgis_raster;
+SELECT ST_SRID(ST_Transform(ST_SetSRID(ST_AddBand(ST_MakeEmptyRaster(2,2,0,0,1),'8BUI'),4326),3857));
+CREATE EXTENSION pgcrypto;        SELECT digest('x','sha256');
+CREATE EXTENSION "uuid-ossp";     SELECT uuid_generate_v4();
+SQL
+    fi
     # backup/restore roundtrip: dump bk (custom format), drop+recreate from a DIFFERENT db
     # (can't drop the open one), pg_restore, verify the row survives.
     "$bin/createdb" -h "$sockdir" -p "$port" -U postgres bk
