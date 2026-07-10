@@ -433,7 +433,7 @@ _vs_dir() {
 # are newer-only). UCRT (ucrtbase/api-ms-win-*) ships with Windows 10+, so it is NOT
 # bundled. No-op off Windows.
 windows_bundle_runtime() {
-  local stage="$1" vs redist crtdir f
+  local stage="$1" vs redist crtdir f copied=0
   [[ "$(host_os)" == windows ]] || return 0
   mkdir -p "$stage/bin"
   # In CI, inability to bundle the runtime is a hard error (windows-latest always has VS):
@@ -444,12 +444,20 @@ windows_bundle_runtime() {
   # Newest x64 CRT redist dir (…/VC/Redist/MSVC/<ver>/x64/Microsoft.VC*.CRT).
   crtdir="$(ls -d "$vs"/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT 2>/dev/null | sort -V | tail -1)"
   [[ -n "$crtdir" && -d "$crtdir" ]] || { echo "windows_bundle_runtime: no CRT redist dir under $vs" >&2; return "$ci_fail"; }
-  for f in vcruntime140.dll vcruntime140_1.dll msvcp140.dll msvcp140_1.dll msvcp140_2.dll concrt140.dll; do
-    [[ -e "$crtdir/$f" ]] && cp -f "$crtdir/$f" "$stage/bin/"
+  # Copy the whole CRT redist folder's DLLs, not a hardcoded allowlist: msvcp140* /
+  # vcruntime140* / concrt140 plus their satellites (msvcp140_atomic_wait.dll,
+  # msvcp140_codecvt_ids.dll, …) that newer engines import. A per-file list silently breaks
+  # the self-contain gate whenever an engine picks up a CRT satellite it didn't before
+  # (e.g. MySQL 9.7's mysqld.exe → msvcp140_atomic_wait.dll). UCRT (ucrtbase/api-ms-win-*)
+  # ships with Windows 10+, so it is NOT here (the folder doesn't contain it).
+  for f in "$crtdir"/*.dll; do
+    [[ -e "$f" ]] || continue   # nullglob-safe: literal pattern when the folder is empty
+    cp -f "$f" "$stage/bin/"; copied=1
   done
+  [[ "$copied" == 1 ]] || { echo "windows_bundle_runtime: no DLLs found in $crtdir" >&2; return "$ci_fail"; }
   # Redistribution of these DLLs is licensed by the folder-level grant for VC\Redist
   # (https://aka.ms/vs/17/redist.txt), not a per-file enumeration; they come straight from
-  # that folder. (On Build Tools the on-disk Redist.txt is just a pointer to that URL.)
+  # that folder as a unit. (On Build Tools the on-disk Redist.txt is just a pointer to that URL.)
   echo ">> windows_bundle_runtime: from $crtdir (license: https://aka.ms/vs/17/redist.txt)"
 }
 
