@@ -89,12 +89,39 @@ build_postgres_full() {
     cp -R "$broot"/bin/.   "$sf/bin/"   2>/dev/null || true
     cp -R "$broot"/lib/.   "$sf/lib/"   2>/dev/null || true
     cp -R "$broot"/share/. "$sf/share/" 2>/dev/null || true
+    # GDAL's runtime data sits at the bundle ROOT as gdal-data/ (the bundle nests proj.db under
+    # share/contrib/ but keeps GDAL data top-level), so the share/ overlay above misses it. Stage
+    # it as share/gdal — matching the Unix `full` layout so the daemon/smoke PROJ_DATA/GDAL_DATA
+    # probe (which searches the tree for gdalvrt.xsd) resolves it; else postgis_raster reprojection
+    # can't find its data files post-relocation.
+    [[ -d "$broot/gdal-data" ]] && { mkdir -p "$sf/share/gdal"; cp -R "$broot/gdal-data/." "$sf/share/gdal/"; }
     windows_bundle_runtime "$sf"
     # windows_self_contain_gate scans only bin/*.exe (not the overlaid lib/ DLLs) — the geo-less
     # Windows runner's `CREATE EXTENSION postgis` smoke is the real load test for the overlay.
     windows_self_contain_gate "$sf"
     [[ -n "$(find "$sf/share" -name 'postgis.control' -print -quit)" ]] \
       || { echo "postgres(full,windows): postgis.control missing after overlay" >&2; return 1; }
+    [[ -n "$(find "$sf/share" -name 'gdalvrt.xsd' -print -quit)" ]] \
+      || { echo "postgres(full,windows): GDAL data (gdalvrt.xsd) missing after overlay" >&2; return 1; }
+    # The OSGeo bundle vendors many components beyond PostGIS — SFCGAL/CGAL/GMP, pgRouting,
+    # MobilityDB, pgPointCloud, h3, ogr_fdw, pg_sphere, GSL (GPLv3), ... — each with its own
+    # license/copyright, none covered by the six geo notices the shared block below stages. Ship
+    # the bundle's OWN notice files verbatim (keeping their relative paths under
+    # LICENSES/postgis-bundle/) so the redistributed artifact carries the complete set upstream
+    # curated, self-updating when the pinned bundle version changes rather than a hand-kept list
+    # that drifts. bin/COPYING is the GPLv2 aggregate; LICENSE (Apache-2.0) + the per-component
+    # COPYRIGHT/LICENSE files cover the rest.
+    local lf rel n=0
+    while IFS= read -r -d '' lf; do
+      rel="${lf#"$broot"/}"
+      mkdir -p "$sf/LICENSES/postgis-bundle/$(dirname "$rel")"
+      cp "$lf" "$sf/LICENSES/postgis-bundle/$rel"
+      n=$((n + 1))
+    done < <(find "$broot" -maxdepth 2 -type f \
+               \( -iname '*licen[sc]e*' -o -iname '*copying*' -o -iname '*copyright*' \
+                  -o -iname '*notice*' -o -iname 'AUTHORS.md' \) -print0)
+    [[ "$n" -gt 0 ]] || { echo "postgres(full,windows): no bundle license/notice files staged" >&2; return 1; }
+    echo ">> staged $n postgis-bundle license/notice file(s) under LICENSES/postgis-bundle/"
   else
     # ---- Unix: second from-source postgres with the geo/crypto flags on ----
     ensure_postgis_deps || { echo "postgres(full): geo/build deps unavailable" >&2; return 1; }

@@ -54,6 +54,14 @@ on:
         type: string
         required: false
         default: ""
+      postgis_win_upstream:
+        description: >-
+          postgres slot only — pin the Windows PostGIS bundle version (e.g. 3.6.2) for the
+          `full` variant. Leave empty to auto-discover the latest OSGeo bundle. Ignored by
+          other services/platforms.
+        type: string
+        required: false
+        default: ""
 
 # Serialize whole runs so two dispatches can't race on services.json.
 concurrency:
@@ -75,6 +83,9 @@ env:
   # ignored by non-Windows legs / non-matching services. Read by build-service.sh / lib.sh.
   REDIS_WIN_UPSTREAM: ${{ inputs.redis_win_upstream }}
   POSTGRES_WIN_BUILDNO: ${{ inputs.postgres_win_buildno }}
+  # postgres `full` variant on Windows: pin the OSGeo PostGIS bundle version, or leave empty
+  # to auto-discover the latest (OSGeo hosts only the current bundle per pg major).
+  POSTGIS_WIN_UPSTREAM: ${{ inputs.postgis_win_upstream }}
 
 jobs:
   # Create the rolling release once if missing. Runs in parallel with build; finalize

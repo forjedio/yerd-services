@@ -438,12 +438,27 @@ ensure_postgis_deps() {
 
 # postgis_win_url <pg_major> [postgis_ver]: the prebuilt, self-contained OSGeo PostGIS bundle
 # for the EDB PostgreSQL <pg_major> (carries its own GEOS/PROJ/GDAL/libxml DLLs + data). The
-# exact PostGIS version isn't derivable from the pg major; prefer POSTGIS_WIN_UPSTREAM, else fail
-# loudly (the OSGeo dir lists them but has no autoindex API here — pin it).
+# exact PostGIS version isn't derivable from the pg major, and OSGeo hosts only the *current*
+# bundle per major (no version archive) — so a POSTGIS_WIN_UPSTREAM pin goes stale the moment
+# they publish a newer one. Prefer the pin when set (and still present); otherwise scrape the
+# per-major directory listing and take the highest bundle version there.
 postgis_win_url() {
-  local pgmaj="$1" pv="${2:-${POSTGIS_WIN_UPSTREAM:-}}" url
-  [[ -n "$pv" ]] || { echo "postgis_win_url: set POSTGIS_WIN_UPSTREAM to the bundle version (e.g. 3.5.3)" >&2; return 1; }
-  url="https://download.osgeo.org/postgis/windows/pg${pgmaj}/postgis-bundle-pg${pgmaj}-${pv}x64.zip"
+  local pgmaj="$1" pv="${2:-${POSTGIS_WIN_UPSTREAM:-}}" dir url
+  dir="https://download.osgeo.org/postgis/windows/pg${pgmaj}/"
+  if [[ -n "$pv" ]]; then
+    url="${dir}postgis-bundle-pg${pgmaj}-${pv}x64.zip"
+    _url_ok "$url" && { echo "$url"; return 0; }
+    echo "postgis_win_url: pinned POSTGIS_WIN_UPSTREAM '$pv' not found: $url" >&2
+    return 1
+  fi
+  # Auto-discover: OSGeo keeps only the latest bundle per pg major, so scrape the listing and
+  # pick the highest version present (sort -V). Pin POSTGIS_WIN_UPSTREAM to override.
+  pv="$(curl -fsSL "$dir" 2>/dev/null \
+        | grep -oE "postgis-bundle-pg${pgmaj}-[0-9.]+x64\.zip" \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+        | sort -V | tail -1)"
+  [[ -n "$pv" ]] || { echo "postgis_win_url: no bundle found under $dir (set POSTGIS_WIN_UPSTREAM to pin)" >&2; return 1; }
+  url="${dir}postgis-bundle-pg${pgmaj}-${pv}x64.zip"
   _url_ok "$url" || { echo "postgis_win_url: not found: $url" >&2; return 1; }
   echo "$url"
 }
