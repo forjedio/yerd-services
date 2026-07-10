@@ -151,25 +151,21 @@ jobs:
       - name: Build artifact for ${{ matrix.target }}
         run: |
           scripts/build-service.sh "${{ inputs.service }}" "${{ inputs.version }}" "${{ inputs.upstream }}"
-      - name: De-mask geo libs before smoke (postgres full, unix only)
-        # The postgres `full` build apt/brew-installs GEOS/PROJ/GDAL; leaving them installed lets
-        # ld.so.cache / brew's dylib dir satisfy the artifact's deps, masking a broken bundle and
-        # turning smoke falsely green. Remove them so resolution comes ONLY from the bundle. NOT in
-        # smoke-test.sh (it runs on dev boxes). autoremove is essential — removing just the -dev
-        # packages leaves the auto-installed runtime .so packages (and the mask) behind.
-        if: ${{ inputs.service == 'postgres' && matrix.target != 'windows-x86_64' }}
+      - name: De-mask geo libs before smoke (postgres full, LINUX only)
+        # The postgres `full` build apt-installs GEOS/PROJ/GDAL; on Linux, leaving them installed
+        # lets ld.so.cache satisfy the artifact's deps, masking a broken bundle and turning smoke
+        # falsely green — so remove them (autoremove is essential: removing just the -dev packages
+        # leaves the auto-installed runtime .so packages, and the mask, behind). LINUX ONLY:
+        # macOS dyld resolves @rpath against the binary's own LC_RPATH (pointed into the bundle by
+        # macos_make_relocatable, with macos_self_contain_gate proving zero /opt/homebrew refs at
+        # build time) — there is no global cache to fall back to, so brew geo can't mask anything
+        # and uninstalling it is both unnecessary and fragile on the runner.
+        if: ${{ inputs.service == 'postgres' && startsWith(matrix.target, 'linux') }}
         run: |
-          if [[ "$RUNNER_OS" == Linux ]]; then
-            sudo apt-get remove -y libgeos-dev libproj-dev libgdal-dev >/dev/null 2>&1 || true
-            sudo apt-get autoremove -y >/dev/null 2>&1 || true
-            ! ldconfig -p | grep -qE 'libgdal|libproj\.|libgeos_c' \
-              || { echo "de-mask: system geo runtime libs still present" >&2; exit 1; }
-          else
-            brew uninstall --ignore-dependencies gdal proj geos >/dev/null 2>&1 || true
-            for f in gdal proj geos; do
-              brew list "$f" >/dev/null 2>&1 && { echo "de-mask: brew $f still present" >&2; exit 1; }
-            done
-          fi
+          sudo apt-get remove -y libgeos-dev libproj-dev libgdal-dev >/dev/null 2>&1 || true
+          sudo apt-get autoremove -y >/dev/null 2>&1 || true
+          ! ldconfig -p | grep -qE 'libgdal|libproj\.|libgeos_c' \
+            || { echo "de-mask: system geo runtime libs still present" >&2; exit 1; }
       - name: Smoke-test the artifact(s)
         # Extract each packed tarball to a throwaway dir, start the server, run SELECT 1 (+ the
         # extension/PostGIS checks). A failed healthcheck fails the leg → finalize skips → nothing
