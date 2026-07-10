@@ -92,7 +92,7 @@ case "$service" in
     [[ "$out" == "1" ]] || { echo "mysql: SELECT 1 returned '$out'" >&2; exit 1; }
     # backup/restore roundtrip: dump bk, drop it, restore, verify the row survives.
     "$bin/mysql" --socket="$sock" -uroot -e 'CREATE DATABASE bk; CREATE TABLE bk.t(id INT); INSERT INTO bk.t VALUES(42);'
-    "$bin/mysqldump" --no-tablespaces --single-transaction --socket="$sock" -uroot bk > "$extract/dump.sql"
+    "$bin/mysqldump" --no-tablespaces --single-transaction --set-gtid-purged=OFF --socket="$sock" -uroot bk > "$extract/dump.sql"
     "$bin/mysql" --socket="$sock" -uroot -e 'DROP DATABASE bk; CREATE DATABASE bk;'
     "$bin/mysql" --socket="$sock" -uroot bk < "$extract/dump.sql"
     rt="$("$bin/mysql" --socket="$sock" -uroot -N -e 'SELECT id FROM bk.t')"
