@@ -62,6 +62,14 @@ on:
         type: string
         required: false
         default: ""
+      timescaledb_upstream:
+        description: >-
+          postgres slot only — pin the TimescaleDB version (e.g. 2.28.3) bundled into the unix
+          `full` variant (PG 15-18 only). Leave empty for the recipe default. Ignored by other
+          services/platforms.
+        type: string
+        required: false
+        default: ""
 
 # Serialize whole runs so two dispatches can't race on services.json.
 concurrency:
@@ -86,6 +94,8 @@ env:
   # postgres `full` variant on Windows: pin the OSGeo PostGIS bundle version, or leave empty
   # to auto-discover the latest (OSGeo hosts only the current bundle per pg major).
   POSTGIS_WIN_UPSTREAM: ${{ inputs.postgis_win_upstream }}
+  # postgres `full` variant on unix: pin the TimescaleDB version (empty -> recipe default).
+  TIMESCALEDB_UPSTREAM: ${{ inputs.timescaledb_upstream }}
 
 jobs:
   # Create the rolling release once if missing. Runs in parallel with build; finalize

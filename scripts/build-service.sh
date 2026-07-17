@@ -151,6 +151,44 @@ build_postgres_full() {
     tar xf "$work/pgvector.tar.gz" -C "$work/pgvector_full" --strip-components 1   # fetched by base
     make -C "$work/pgvector_full" PG_CONFIG="$pgi/bin/pg_config" OPTFLAGS="" -j"$jobs"
     make -C "$work/pgvector_full" PG_CONFIG="$pgi/bin/pg_config" OPTFLAGS="" install-strip
+    # TimescaleDB (Community/TSL) — time-series extension. Built with CMake against the pg we just
+    # built. Telemetry + OpenSSL OFF: no phone-home, and the module then links nothing beyond libc/
+    # the postgres runtime (enforced by the relocation gates below), so it self-contains + relocates
+    # like the contrib .so's. TSL is bundled ONLY in `full` (never the permissive base) and only on
+    # unix (Windows upstream is a setup.exe wizard, not a file-drop — deferred, like pgvector).
+    # TimescaleDB supports only PG 15–18 (cmake FATAL_ERRORs otherwise) while this recipe builds
+    # arbitrary majors, so SKIP it (don't fail the leg) elsewhere — `full` still ships without it.
+    # Keep the `-le 18` bound in sync with TIMESCALEDB_UPSTREAM (2.28.x = 15–18).
+    local ts_pgmaj; ts_pgmaj="$(printf '%s\n' "$upstream" | cut -d. -f1)"
+    if [[ "$ts_pgmaj" =~ ^[0-9]+$ && "$ts_pgmaj" -ge 15 && "$ts_pgmaj" -le 18 ]]; then
+      ensure_cmake || { echo "postgres(full): cmake unavailable for timescaledb" >&2; return 1; }
+      local timescaledb_ver="${TIMESCALEDB_UPSTREAM:-2.28.3}"
+      fetch_to "https://github.com/timescale/timescaledb/archive/refs/tags/${timescaledb_ver}.tar.gz" \
+        "$work/timescaledb.tar.gz"
+      rm -rf "$work/timescaledb"; mkdir -p "$work/timescaledb"
+      tar xf "$work/timescaledb.tar.gz" -C "$work/timescaledb" --strip-components 1
+      ( cd "$work/timescaledb" && rm -rf build && mkdir build && cd build \
+          && cmake .. -DCMAKE_BUILD_TYPE=Release -DPG_CONFIG="$pgi/bin/pg_config" \
+               -DAPACHE_ONLY=0 -DUSE_TELEMETRY=OFF -DUSE_OPENSSL=OFF -DREGRESS_CHECKS=OFF \
+          && make -j"$jobs" \
+          && make install )
+      # Presence assert at BUILD time against $pgi/share (the install prefix) — the later
+      # cp -R "$pgi/share" "$sf/share" hasn't run yet, so do NOT check $sf/share here.
+      [[ -n "$(find "$pgi/share" -name timescaledb.control -print -quit)" ]] \
+        || { echo "postgres(full): timescaledb.control missing after build" >&2; return 1; }
+      # TimescaleDB notices (dual-license: Apache-2 core + TSL for tsl/). Copied verbatim from the
+      # extracted source so they track the pinned version. Staged here (inside the built branch) so
+      # the shared license block below — which also runs on the windows path — never references them.
+      local ts_pair ts_s ts_d
+      for ts_pair in "LICENSE:LICENSE-timescaledb" "LICENSE-APACHE:LICENSE-timescaledb-apache" \
+                     "tsl/LICENSE-TIMESCALE:LICENSE-timescaledb-tsl" "NOTICE:NOTICE-timescaledb"; do
+        ts_s="${ts_pair%%:*}"; ts_d="${ts_pair##*:}"
+        [[ -f "$work/timescaledb/$ts_s" ]] || { echo "postgres(full): timescaledb $ts_s missing" >&2; return 1; }
+        cp "$work/timescaledb/$ts_s" "$sf/$ts_d"
+      done
+    else
+      echo ">> postgres(full): timescaledb skipped (pg major '${ts_pgmaj}' outside supported 15-18)" >&2
+    fi
     # PostGIS (with raster, on by default in 3.x) against the pg we just built.
     local postgis_ver="${POSTGIS_UPSTREAM:-3.6.0}"
     fetch_to "https://download.osgeo.org/postgis/source/postgis-${postgis_ver}.tar.gz" \

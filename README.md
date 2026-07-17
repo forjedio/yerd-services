@@ -180,6 +180,9 @@ The **postgres `full`** variant (see [Variants](#variants)) additionally builds 
 [GDAL](https://gdal.org/) (MIT) + json-c/protobuf-c — GEOS/PROJ/GDAL provisioned from the
 platform package manager (apt/brew) and bundled+relocated into the artifact; Windows overlays the
 prebuilt [OSGeo PostGIS bundle](https://download.osgeo.org/postgis/windows/) (`POSTGIS_WIN_UPSTREAM`).
+Unix `full` also bundles [TimescaleDB](https://github.com/timescale/timescaledb) Community edition
+(`TIMESCALEDB_UPSTREAM`, default `2.28.3`, [TSL](https://github.com/timescale/timescaledb/blob/main/tsl/LICENSE-TIMESCALE)) —
+see [Bundled extensions](#bundled-extensions).
 
 Each `(service, version)` is built per dispatch; the `<upstream>` actually used is whatever
 you pass. Every published artifact is **smoke-tested** on its native platform (start the
@@ -209,8 +212,20 @@ relocatable with everything else.
   `LICENSE-pgvector`. Not bundled on Windows (absent from the EDB zip; a native MSVC build is
   a separate effort).
 
-Not in the lean base (they need OpenSSL/libxml/uuid or heavy GPL deps): `pgcrypto`, `uuid-ossp`,
-`sslinfo`, `xml2`, and **PostGIS** — these ship in the **`full` variant** instead (see below).
+- **TimescaleDB (Linux/macOS `full` variant only):** Community edition (TSL — hypertables plus
+  compression, continuous aggregates, retention/reorder policies), built with CMake against the same
+  server, pinned to `TIMESCALEDB_UPSTREAM` (default `2.28.3`), telemetry and OpenSSL compiled out
+  (`-DUSE_TELEMETRY=OFF -DUSE_OPENSSL=OFF`) so it phones home to nothing and self-contains like the
+  contrib `.so`s. Only bundled for **PostgreSQL 15–18** (upstream cmake supports no other majors); on
+  any other major the step is **skipped** and `full` still builds without it. Ships its notices as
+  `LICENSE-timescaledb` (dual-license explainer), `LICENSE-timescaledb-apache`, `LICENSE-timescaledb-tsl`,
+  and `NOTICE-timescaledb`. Not bundled on Windows (upstream ships a `setup.exe` wizard, not a
+  file-drop — deferred, like pgvector). **Requires `shared_preload_libraries = 'timescaledb'`** at
+  runtime (see [Variants](#variants)).
+
+Not in the lean base (they need OpenSSL/libxml/uuid or heavy GPL/TSL deps): `pgcrypto`, `uuid-ossp`,
+`sslinfo`, `xml2`, **PostGIS**, and **TimescaleDB** — these ship in the **`full` variant** instead
+(see below).
 Every build **smoke-tests** each bundled extension by creating it and calling a function (forcing
 the `.so` to load post-relocation) before publishing.
 
@@ -227,15 +242,26 @@ suffix) is the lean, 100%-permissive default. Reserved variant names:
 | variant | service | contents | license |
 |---------|---------|----------|---------|
 | _(none)_ | all | lean base (permissive) | per-service base |
-| `full` | `postgres` | base + pgvector (unix) + **PostGIS w/ raster** + all now-buildable contrib (`pgcrypto`, `uuid-ossp`, `sslinfo`, `xml2`) | **GPLv2** (PostGIS) + LGPL-2.1 (GEOS) + permissive |
+| `full` | `postgres` | base + pgvector (unix) + **PostGIS w/ raster** + **TimescaleDB** (unix, PG 15–18) + all now-buildable contrib (`pgcrypto`, `uuid-ossp`, `sslinfo`, `xml2`) | **GPLv2** (PostGIS) + LGPL-2.1 (GEOS) + **TSL** (TimescaleDB) + permissive |
 
 One `service=postgres` dispatch builds **both** `postgres-<ver>` and `postgres-<ver>-full`.
 `action=remove version=<ver>` removes both. Key properties:
 
-- **GPL is confined to `full`.** The default `postgres` artifact stays 100% PostgreSQL License;
-  only `full` carries GPLv2 (PostGIS) / LGPL-2.1 (GEOS). PostgreSQL core is unaffected (PostGIS is
-  a runtime-loaded module + mere aggregation in the tarball); each component's notice ships inside
-  the `full` tarball (`LICENSE-postgis`, `LICENSE-geos`, `LICENSE-proj`, `LICENSE-gdal`, …).
+- **GPL/TSL are confined to `full`.** The default `postgres` artifact stays 100% PostgreSQL License;
+  only `full` carries GPLv2 (PostGIS) / LGPL-2.1 (GEOS) / TSL (TimescaleDB). PostgreSQL core is
+  unaffected (each is a runtime-loaded module + mere aggregation in the tarball); each component's
+  notice ships inside the `full` tarball (`LICENSE-postgis`, `LICENSE-geos`, `LICENSE-proj`,
+  `LICENSE-gdal`, `LICENSE-timescaledb*`, …). The **Timescale License** is source-available and
+  permits redistributing binaries in a tool like this; it only forbids offering the software as a
+  managed database-as-a-service — not applicable to local `yerd` installs.
+- **TimescaleDB needs a preload.** `CREATE EXTENSION timescaledb` fails unless
+  `shared_preload_libraries = 'timescaledb'` is set at postmaster start. The launcher (yerd daemon)
+  must add it to `postgresql.conf` for `full` installs — a **prerequisite for using `full`'s
+  TimescaleDB** (a required follow-up in the daemon repo; the label/install path itself needs no
+  daemon change). The build's smoke test starts the server with
+  `-c shared_preload_libraries=timescaledb` and exercises a hypertable + compression policy, so it
+  validates the exact preload the daemon will configure. Bundled only for PostgreSQL 15–18; other
+  majors skip it. Build against **17.2+/16.6+** (avoid the ABI-broken 17.1/16.5/15.9 minors).
 - **Datadirs are isolated.** `17` and `17-full` are distinct labels → distinct installs + datadirs.
   A datadir with PostGIS objects can only be opened by the `full` build; base→full is safe (full is
   a superset), full→base is not once PostGIS is used. Do not point one variant's binaries at the
@@ -247,9 +273,10 @@ One `service=postgres` dispatch builds **both** `postgres-<ver>` and `postgres-<
   smoke test exports them at the bundled dirs and runs `ST_Transform`, so it validates the exact
   bundle+env the daemon will use.
 - **Windows `full`** overlays the prebuilt OSGeo PostGIS bundle onto the EDB tree (pin
-  `POSTGIS_WIN_UPSTREAM`); it has no pgvector (absent upstream). Unix `full` is source-built
+  `POSTGIS_WIN_UPSTREAM`); it has no pgvector and no TimescaleDB (both absent from the file-drop
+  path — TimescaleDB ships a `setup.exe` wizard upstream). Unix `full` is source-built
   (`POSTGIS_UPSTREAM` default `3.6.0`, GEOS/PROJ/GDAL from the platform package manager, the whole
-  geo chain bundled + relocated + gated).
+  geo chain bundled + relocated + gated; TimescaleDB `TIMESCALEDB_UPSTREAM` default `2.28.3`).
 
 ## Repo layout
 
@@ -271,6 +298,8 @@ yerd-services/
 │   ├── gdal-MIT.txt                    #   "   (MIT)
 │   ├── json-c-MIT.txt                  #   "   (MIT)
 │   └── protobuf-c-BSD-2-Clause.txt     #   "   (BSD-2)
+│                                       # TimescaleDB notices are copied from its source tree at
+│                                       # build time (LICENSE-timescaledb*, NOTICE-timescaledb)
 ├── scripts/
 │   ├── lib.sh                      # os/arch tokens, canonical_service, artifact_filename, pack_stage, macos_make_relocatable, …
 │   ├── build-service.sh            # build/repackage ONE (service,version,upstream) for the host platform

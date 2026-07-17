@@ -389,6 +389,26 @@ ensure_mariadb_build_deps() {
   [[ "${bmaj:-0}" -ge 3 ]] || { echo "ensure_mariadb_build_deps: bison >= 3 required ($(bison --version 2>/dev/null | head -1))" >&2; return 1; }
 }
 
+# ensure_cmake: install cmake (>= 3.15) if absent, root-aware. TimescaleDB's build (postgres `full`
+# variant) needs it — the rest of the postgres path uses autoconf/make, so cmake isn't otherwise
+# provisioned. Assert the version, since an old-distro apt cmake can be < 3.15 (GitHub runners ship a
+# modern one, so the install path is rarely taken); fail loudly here rather than at configure time.
+ensure_cmake() {
+  if ! command -v cmake >/dev/null 2>&1; then
+    if [[ "$(host_os)" == macos ]]; then
+      command -v brew >/dev/null 2>&1 && brew install cmake >/dev/null 2>&1 || true
+    else
+      command -v apt-get >/dev/null 2>&1 && apt_get install -y cmake >/dev/null 2>&1 || true
+    fi
+  fi
+  command -v cmake >/dev/null 2>&1 || { echo "ensure_cmake: cmake not found and could not be installed" >&2; return 1; }
+  local cv cmaj cmin
+  cv="$(cmake --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+  cmaj="${cv%%.*}"; cmin="${cv##*.}"
+  [[ "${cmaj:-0}" -gt 3 || ( "${cmaj:-0}" -eq 3 && "${cmin:-0}" -ge 15 ) ]] \
+    || { echo "ensure_cmake: cmake >= 3.15 required (found ${cv:-none})" >&2; return 1; }
+}
+
 # ensure_mariadb_runtime_deps: install the linux-systemd bintar's runtime chain (root-aware) so
 # linux_self_contain's ldd sweep can bundle it. Tolerant per package (names vary across releases).
 ensure_mariadb_runtime_deps() {

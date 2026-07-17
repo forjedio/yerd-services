@@ -264,10 +264,17 @@ case "$service" in
       gdd="$(find "$extract" -name gdalvrt.xsd -print -quit)"
       [[ -n "$gdd" ]] && { GDAL_DATA="$(dirname "$gdd")"; export GDAL_DATA; }
     fi
+    # TimescaleDB (full/unix only) requires its loader in shared_preload_libraries at postmaster
+    # start — probe independently of postgis (a bad/unloadable module then fails `pg_ctl start`,
+    # which is the desired fail-closed behavior).
+    ts=""
+    [[ -n "$(find "$extract/share" -name timescaledb.control -print -quit)" ]] && ts=1
     "$bin/initdb" -A trust -U postgres --locale=C -D "$data" >/dev/null
     # -k sets the socket DIRECTORY; psql -h must be that same directory; -p must match the
     # server's port on every connecting call.
-    "$bin/pg_ctl" -D "$data" -o "-k $sockdir -p $port" -w -t 60 start
+    pgopts="-k $sockdir -p $port"
+    [[ -n "$ts" ]] && pgopts="$pgopts -c shared_preload_libraries=timescaledb"
+    "$bin/pg_ctl" -D "$data" -o "$pgopts" -w -t 60 start
     out="$("$bin/psql" -h "$sockdir" -p "$port" -U postgres -tAc 'SELECT 1')"
     [[ "$out" == "1" ]] || { echo "postgres: SELECT 1 returned '$out'" >&2; exit 1; }
     # extensions: create + exercise one function each to force the .so to dlopen — proves the
@@ -295,6 +302,20 @@ CREATE EXTENSION postgis_raster;
 SELECT ST_SRID(ST_Transform(ST_SetSRID(ST_AddBand(ST_MakeEmptyRaster(2,2,0,0,1),'8BUI'),4326),3857));
 CREATE EXTENSION pgcrypto;        SELECT digest('x','sha256');
 CREATE EXTENSION "uuid-ossp";     SELECT uuid_generate_v4();
+SQL
+    fi
+    # timescaledb (full/unix): create a hypertable + a compression policy. add_compression_policy is
+    # a TSL-only function, so this forces the timescaledb-tsl-<ver>.so to dlopen — proving the TSL
+    # module relocated, not just that the loader preloaded. Requires the preload set above.
+    if [[ -n "$ts" ]]; then
+      "$bin/psql" -h "$sockdir" -p "$port" -U postgres -d postgres -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE EXTENSION timescaledb;
+CREATE TABLE ts_m (t timestamptz NOT NULL, v double precision);
+SELECT create_hypertable('ts_m', by_range('t'));
+INSERT INTO ts_m VALUES (now(), 1), (now(), 2);
+ALTER TABLE ts_m SET (timescaledb.compress);
+SELECT add_compression_policy('ts_m', INTERVAL '7 days');
+SELECT count(*) FROM ts_m;
 SQL
     fi
     # backup/restore roundtrip: dump bk (custom format), drop+recreate from a DIFFERENT db
