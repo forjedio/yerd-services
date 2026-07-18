@@ -86,9 +86,19 @@ build_postgres_full() {
     fetch_to "$burl" "$work/postgis-win.zip"
     unzip_vendor "$work/postgis-win.zip" "$work/pgis"
     local broot; broot="$(vendor_root "$work/pgis")"
-    cp -R "$broot"/bin/.   "$sf/bin/"   2>/dev/null || true
-    cp -R "$broot"/lib/.   "$sf/lib/"   2>/dev/null || true
-    cp -R "$broot"/share/. "$sf/share/" 2>/dev/null || true
+    # bin/ overlay is NON-CLOBBERING (cp -n): win_stage_bin already staged EDB's own bin/*.dll —
+    # a matched runtime set built against EDB's OpenSSL 3.5.x. The OSGeo bundle ships SAME-NAMED but
+    # older copies of seven shared runtime DLLs (libcrypto-3-x64/libssl-3-x64 = OpenSSL 3.0.7, plus
+    # libcurl/libiconv-2/liblz4/libzstd/zlib1). A plain clobbering copy would down-rev those under
+    # EDB's binaries, and EDB's pgcrypto.dll — linked to 3.5.x — then can't load against 3.0.7
+    # ("could not load library pgcrypto.dll: The specified procedure could not be found"). So EDB's
+    # newer runtime must win every name collision; the bundle only ADDS the geo DLLs EDB lacks
+    # (GEOS/PROJ/GDAL/libxml/…). Safe direction: OpenSSL 3.x + these C libs keep ABI back-compat, so
+    # the bundle's geo DLLs (built vs the 2022 set) load fine against EDB's 2026 set. lib/ + share/
+    # have zero name collisions with the EDB tree, so those overlays stay plain (fully additive).
+    cp -Rn "$broot"/bin/.  "$sf/bin/"   2>/dev/null || true
+    cp -R  "$broot"/lib/.   "$sf/lib/"   2>/dev/null || true
+    cp -R  "$broot"/share/. "$sf/share/" 2>/dev/null || true
     # GDAL's runtime data sits at the bundle ROOT as gdal-data/ (the bundle nests proj.db under
     # share/contrib/ but keeps GDAL data top-level), so the share/ overlay above misses it. Stage
     # it as share/gdal — matching the Unix `full` layout so the daemon/smoke PROJ_DATA/GDAL_DATA
