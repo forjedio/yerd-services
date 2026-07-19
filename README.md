@@ -6,8 +6,8 @@ where the [Yerd](https://github.com/forjedio/yerd) daemon downloads them on dema
 (`yerd service install <svc> <version>`).
 
 There is no static-php-cli equivalent for databases — no single project ships clean,
-multi-platform prebuilt binaries for Redis/Valkey, MySQL, MariaDB, and Postgres. So Yerd
-hosts its own. This repo is that host.
+multi-platform prebuilt binaries for Redis/Valkey, MySQL, MariaDB, Postgres, and Meilisearch.
+So Yerd hosts its own. This repo is that host.
 
 It is intentionally **isolated** from the main app:
 
@@ -26,6 +26,7 @@ It is intentionally **isolated** from the main app:
 | `mysql`    | Oracle MySQL (GPLv2) | 2 | ✅ implemented (repackage generic tarball) |
 | `postgres` | PostgreSQL (PostgreSQL License) | 2 | ✅ implemented (build from source) |
 | `mariadb`  | MariaDB (GPLv2) | 3 | ✅ implemented (repackage x86_64 + build from source for ARM/macOS) |
+| `meilisearch` | Meilisearch **Community Edition** (MIT) | 4 | ✅ implemented (build from source, Linux/macOS) |
 
 The `redis` slot ships **[Valkey](https://github.com/valkey-io/valkey)** (Linux Foundation,
 BSD-3, wire-compatible) because Redis 7.4+ is SSPL/RSALv2 (redistribution-restricted).
@@ -64,11 +65,11 @@ This is the entire coupling with `forjedio/yerd`. The consumer there
 this shape.
 
 **Filename:** `<service-id>-<version>-<os>-<arch>.tar.gz`
-- `service-id ∈ redis | mysql | mariadb | postgres` (the `redis` slot is served by Valkey on
-  Linux/macOS, and by the native MSVC Redis port on Windows — see below)
+- `service-id ∈ redis | mysql | mariadb | postgres | meilisearch` (the `redis` slot is served by
+  Valkey on Linux/macOS, and by the native MSVC Redis port on Windows — see below)
 - `os ∈ linux | macos | windows`, `arch ∈ x86_64 | aarch64` (Windows is `x86_64` only)
 - examples: `redis-8-linux-x86_64.tar.gz`, `postgres-16-macos-aarch64.tar.gz`,
-  `mysql-8.4.9-windows-x86_64.tar.gz`
+  `mysql-8.4.9-windows-x86_64.tar.gz`, `meilisearch-1.49.0-linux-aarch64.tar.gz`
 
 **Archive:** a gzip tar whose **root** holds a `bin/` directory with the server executable
 (and client/init tools where noted). No absolute/`..` members. Executable bit preserved.
@@ -82,6 +83,7 @@ and points data/socket/port at user paths via config, never compiled-in defaults
 | `mysql`    | `mysqld` | `mysql`, `mysqld_safe`, `mysqldump` |
 | `mariadb`  | `mariadbd` | `mariadb`, `mariadb-install-db`, `mariadb-dump` |
 | `postgres` | `postgres` | `initdb`, `pg_ctl`, `psql`, `createdb`, `pg_dump`, `pg_dumpall`, `pg_restore` |
+| `meilisearch` | `meilisearch` | _(single self-contained binary; no client/init tools)_ |
 
 **Windows differs** from the table above:
 - Executables carry `.exe` (`mysqld.exe`, `postgres.exe`, …). Only the **server binary** is
@@ -125,7 +127,8 @@ Integrity is TLS-only today (no checksum pinning), matching the PHP path.
 
 Each **SQL** service ships the standard logical dump/restore tools in `bin/` so the daemon
 (`forjedio/yerd`) can shell out for `yerd service backup/restore` — backup runs the dump tool to
-a file, restore loads it back. (redis is excluded — its snapshot mechanism is RDB/AOF, not SQL.)
+a file, restore loads it back. (redis is excluded — its snapshot mechanism is RDB/AOF, not SQL;
+meilisearch is excluded too — it is a search engine with its own dump API, not an SQL server.)
 
 | service | backup | restore | file |
 |---------|--------|---------|------|
@@ -156,6 +159,7 @@ the escape hatch is to move `SERVICES_BASE_URL` to a CDN while keeping this arti
 | `mysql` | _(label)_ | [Oracle MySQL](https://dev.mysql.com/downloads/mysql/) generic tarball `<upstream>` (e.g. 8.4.9 LTS) | repackage | `bin/{mysqld,mysql,mysqld_safe,mysqldump}` + bundled `lib/`+`share/`; macOS dylib install-names made relocatable |
 | `postgres` | _(label)_ | [postgresql.org](https://ftp.postgresql.org/pub/source/) source `<upstream>` (e.g. 17.10) | build from source | `./configure --without-icu --without-readline --without-zlib --without-libxml` (no compressed `pg_dump`); macOS made relocatable. Also bundles a curated set of contrib extensions + **pgvector** (`PGVECTOR_UPSTREAM`, default `v0.8.5`) — see [Bundled extensions](#bundled-extensions) |
 | `mariadb` | _(label)_ | [archive.mariadb.org](https://archive.mariadb.org/) `<upstream>` (e.g. 11.8.8 LTS) | repackage (linux-x86_64) / build from source (ARM Linux + macOS) | MariaDB ships only a `linux-systemd-x86_64` bintar; CMake build for the rest (`-DWITH_SSL=system`, heavy plugins trimmed). `bin/{mariadbd,mariadb,mariadb-install-db,my_print_defaults,mariadb-dump,…}` + `lib/`+`share/`; made relocatable + self-contained |
+| `meilisearch` | _(label)_ | [Meilisearch](https://github.com/meilisearch/meilisearch) source tag `<upstream>` (e.g. `v1.49.0`) | build from source (Linux/macOS) | **Community Edition** via `cargo build --release --locked -p meilisearch` (default features — the `enterprise` feature is **not** enabled, so BUSL-1.1 EE code is compiled out; MIT-only). Rust toolchain auto-selected from the source's `rust-toolchain.toml`. Single self-contained `bin/meilisearch` (no `lib/`). **No Windows or `macos-x86_64` leg** — see [Platform matrix](#platform-matrix) |
 
 **Windows (`windows-x86_64`)** — all repackaged from official vendor zips (no service has a
 native Windows ARM64 build, so Windows is x86_64-only; Windows-on-ARM runs x64 via emulation):
@@ -190,9 +194,74 @@ server, run `SELECT 1`/`PING`; on Windows over TCP loopback) before it's allowed
 
 Surface names with trademark care in the UI: **"Redis (Valkey)"** (BSD-3) on Linux/macOS,
 plain **"Redis"** (BSD-3) on Windows; **"MySQL (Oracle)"** (GPLv2, preserve notices) /
-MariaDB (GPLv2), PostgreSQL (permissive). Upstream license texts live in
-[`LICENSES/`](LICENSES/) (Windows redis carries `redis-BSD-3-Clause.txt` + the port's
-combined `redis-windows-port-BSD-3-Clause.txt`).
+MariaDB (GPLv2), PostgreSQL (permissive), **Meilisearch** (MIT, Community Edition). Upstream
+license texts live in [`LICENSES/`](LICENSES/) (Windows redis carries `redis-BSD-3-Clause.txt`
++ the port's combined `redis-windows-port-BSD-3-Clause.txt`).
+
+## Meilisearch (Community Edition)
+
+Meilisearch fills the `meilisearch` service slot: a single self-contained search-engine binary,
+built **from source** on Linux and macOS.
+
+- **Selected version / tag.** Pinned stable release **`v1.49.0`** (the label users install is
+  `1.49.0`; the exact upstream git tag is `v1.49.0`). Any current stable tag can be built by
+  dispatching with a new `version`/`upstream` — the recipe accepts the tag with or without the
+  leading `v`. Keep the `version` label equal to the numeric release so it matches the version
+  embedded in the artifact filename (the daemon and `services.json` require that exact match).
+- **Community Edition provenance.** Meilisearch dual-licenses its tree `MIT AND BUSL-1.1`: the
+  Enterprise Edition parts are gated behind the `enterprise` cargo feature and licensed
+  BUSL-1.1; everything else is MIT. The build enables **only default features** (never
+  `--features enterprise` / `--all-features`), so the EE code is compiled out and the artifact is
+  the **MIT-licensed Community Edition** — the same build as upstream's `meilisearch-*` release
+  binaries (not their `meilisearch-enterprise-*` ones). The tarball ships `LICENSE` (the upstream
+  `MIT AND BUSL-1.1` SPDX explainer) and `LICENSE-MIT` (the operative MIT text); `LICENSE-EE` is
+  intentionally **not** shipped because no Business-Source-licensed code is present in a CE build.
+- **Build prerequisites / toolchain.** A Rust toolchain reachable as `cargo` (GitHub runners
+  preinstall rustup+cargo; a bare host just needs rustup on `PATH`). The exact compiler is **not**
+  pinned here — the Meilisearch source tree carries a `rust-toolchain.toml` (channel `1.91.1` for
+  `v1.49.0`) that rustup honors automatically, so the right toolchain is fetched at build time.
+  Dependencies are resolved reproducibly from the committed `Cargo.lock` via `--locked`; the build
+  is `cargo build --release --locked -p meilisearch`.
+- **Artifact layout / filename.** `meilisearch-<version>-<os>-<arch>.tar.gz`, whose root holds
+  `bin/meilisearch` (executable) plus `LICENSE` + `LICENSE-MIT`. No `lib/` (the binary is
+  self-contained), no top-level version directory. Example verbose listing:
+
+  ```
+  ./LICENSE
+  ./LICENSE-MIT
+  ./bin/meilisearch          (0755, executable)
+  ```
+- **Smoke-test contract.** Every published platform is smoke-tested on its native runner against
+  the *final packaged* binary (extract → run, never the pre-package build output): extract to a
+  throwaway dir, assert `bin/meilisearch` exists and is executable, start it on an unused loopback
+  port with a temporary db path
+  (`bin/meilisearch --http-addr 127.0.0.1:<port> --db-path <tmp> --env development --no-analytics`),
+  then poll `GET http://127.0.0.1:<port>/health` (bounded, ~30s) until it returns **HTTP 200** with
+  a body containing **`{"status":"available"}`**. Startup logs are captured on failure; the process
+  is always terminated/reaped and the temp data removed. A platform is added to `services.json` /
+  published **only** if this passes.
+- **How `services.json` is generated.** Identical to every other service: the workflow derives the
+  manifest purely from the release's live `*.tar.gz` asset filenames (`gen-manifest.sh`), so a
+  meilisearch entry appears iff its artifacts were built, smoke-tested, and uploaded. See
+  [Listing](#the-two-on-demand-flows) / the [Artifact contract](#artifact-contract-the-binding-interface--do-not-drift).
+- **Add / update a version.** Dispatch the release workflow:
+
+  ```sh
+  gh workflow run release.yml \
+    -f action=build -f service=meilisearch -f version=1.49.0 -f upstream=v1.49.0
+  #  → builds linux-x86_64, linux-aarch64, macos-aarch64; uploads meilisearch-1.49.0-*.tar.gz;
+  #    refreshes services.json. Repoint the label by rebuilding the same version with a new tag.
+  gh workflow run release.yml -f action=remove -f service=meilisearch -f version=1.49.0
+  ```
+- **Intentionally omitted platforms.**
+  - **`windows-x86_64`** — the daemon requests only Linux/macOS for meilisearch, and a native
+    Windows-from-source build is a separate effort; `set-matrix` drops the Windows leg for this
+    service (selecting `targets=windows-x86_64` for meilisearch fails loudly with an empty matrix).
+  - **`macos-x86_64`** — no Intel macOS runner exists (GitHub retired `macos-13` in Dec 2025), the
+    same floor as every other service here.
+
+  These match the repo's existing platform floors — building meilisearch from source on the same
+  native runners as Valkey/Postgres neither raises the glibc floor nor the macOS deployment target.
 
 ## Bundled extensions
 
@@ -297,14 +366,16 @@ yerd-services/
 │   ├── proj-X11.txt                    #   "   (X/MIT)
 │   ├── gdal-MIT.txt                    #   "   (MIT)
 │   ├── json-c-MIT.txt                  #   "   (MIT)
-│   └── protobuf-c-BSD-2-Clause.txt     #   "   (BSD-2)
+│   ├── protobuf-c-BSD-2-Clause.txt     #   "   (BSD-2)
+│   └── meilisearch-MIT.txt             # Meilisearch Community Edition (MIT)
 │                                       # TimescaleDB notices are copied from its source tree at
 │                                       # build time (LICENSE-timescaledb*, NOTICE-timescaledb)
 ├── scripts/
 │   ├── lib.sh                      # os/arch tokens, canonical_service, artifact_filename, pack_stage, macos_make_relocatable, …
 │   ├── build-service.sh            # build/repackage ONE (service,version,upstream) for the host platform
-│   ├── smoke-test.sh               # extract a built artifact + run the server (SELECT 1 / PING) — each build leg, pre-publish
-│   └── gen-manifest.sh             # *.tar.gz names (stdin) → services.json (the daemon's listing)
+│   ├── smoke-test.sh               # extract a built artifact + run the server (SELECT 1 / PING / GET /health) — each build leg, pre-publish
+│   ├── gen-manifest.sh             # *.tar.gz names (stdin) → services.json (the daemon's listing)
+│   └── test.sh                     # dependency-free unit tests (naming, archive layout, manifest merge, meilisearch smoke harness)
 └── .github/workflows/
     └── release.yml                 # workflow_dispatch: ensure-release → build (build+smoke) → finalize
 ```
@@ -329,3 +400,9 @@ hardware too. Building from source for ARM Windows is deferred. **Daemon note:**
 `windows-*` artifacts requires companion changes in `forjedio/yerd` (its `Os` enum +
 `current_os_arch()` currently reject Windows); publishing them here is forward-compatible
 (existing daemons only request their own platform token).
+
+**`meilisearch` is Linux/macOS only** (`linux-x86_64`, `linux-aarch64`, `macos-aarch64`). Its
+`set-matrix` step drops the Windows leg (no native Windows-from-source recipe; the daemon requests
+only Linux/macOS for it), and `macos-x86_64` is omitted for the same no-Intel-runner reason as
+every other service. Built from Rust source on the same native runners as Valkey/Postgres, so it
+shares their glibc/macOS floors — no deployment target is silently raised.

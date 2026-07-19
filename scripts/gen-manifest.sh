@@ -36,7 +36,7 @@ emit_triples() {
     service="${rest2%%-*}"; version="${rest2#*-}"; [[ "$version" != "$rest2" ]] || continue
     case "$os"      in linux|macos|windows) ;;    *) continue ;; esac
     case "$arch"    in x86_64|aarch64) ;;         *) continue ;; esac
-    case "$service" in redis|mysql|mariadb|postgres) ;; *) continue ;; esac
+    case "$service" in redis|mysql|mariadb|postgres|meilisearch) ;; *) continue ;; esac
     printf '%s\t%s\t%s-%s\n' "$service" "$version" "$os" "$arch"
   done
 }

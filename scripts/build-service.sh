@@ -573,6 +573,47 @@ case "$service" in
     require_files "$stage" bin/mariadbd bin/mariadb bin/mariadb-install-db bin/my_print_defaults bin/mariadb-dump
     ;;
 
+  meilisearch)
+    # Meilisearch Community Edition, built from an IMMUTABLE tagged source release with cargo.
+    # Rust project: the source tree pins its exact toolchain via rust-toolchain.toml, which rustup
+    # honors automatically — so we do not pin a channel here. `--locked` uses the committed
+    # Cargo.lock for reproducible dependency resolution. `--release` for an optimized binary.
+    #
+    # CE-ONLY: Meilisearch gates its Enterprise Edition behind the `enterprise` cargo feature, which
+    # is NOT in the crate's `default` set — so a default-feature build compiles the BUSL-1.1 EE code
+    # OUT and produces the MIT-licensed Community Edition (identical to upstream's `meilisearch-*`
+    # release binaries, as opposed to their `meilisearch-enterprise-*` ones). We deliberately pass
+    # NO `--features enterprise` / `--all-features`; the default set (mini-dashboard + tokenizers) is
+    # exactly the CE build. Do not add the enterprise feature — that would ship EE.
+    ensure_rust || { echo "meilisearch: cargo/rust toolchain unavailable" >&2; exit 1; }
+    # `upstream` is the exact git tag; accept it with or without the leading `v` (meilisearch tags
+    # are v-prefixed, e.g. v1.49.0) and always fetch the v-prefixed tag archive.
+    meili_tag="v${upstream#v}"
+    fetch_to "https://github.com/meilisearch/meilisearch/archive/refs/tags/${meili_tag}.tar.gz" \
+      "$work/meili.tar.gz"
+    mkdir -p "$work/meili"
+    tar xf "$work/meili.tar.gz" -C "$work/meili" --strip-components 1
+    jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+    # Build only the server binary crate (`meilisearch`). No enterprise feature -> Community Edition.
+    ( cd "$work/meili" && cargo build --release --locked -p meilisearch -j "$jobs" )
+    cp "$work/meili/target/release/meilisearch" "$stage/bin/meilisearch"
+    chmod +x "$stage/bin/meilisearch"
+    # Statically-linked Rust binary (no bundled lib/ needed); strip on Linux for size (macOS keeps
+    # its symbols in the binary but they're modest — leave it to codesign-friendly default).
+    [[ "$OS" == linux ]] && strip "$stage/bin/meilisearch" 2>/dev/null || true
+    # License staging (CE): ship the SPDX explainer as LICENSE plus the operative MIT text as
+    # LICENSE-MIT, copied verbatim from the exact built tag so attribution tracks the source. We do
+    # NOT ship LICENSE-EE: the Business-Source-licensed Enterprise code is compiled out of this CE
+    # build, so only the MIT-covered code is redistributed.
+    [[ -f "$work/meili/LICENSE" ]]     && cp "$work/meili/LICENSE"     "$stage/LICENSE"
+    [[ -f "$work/meili/LICENSE-MIT" ]] && cp "$work/meili/LICENSE-MIT" "$stage/LICENSE-MIT"
+    # Fallback to the repo license home if the source layout ever changes, so the artifact always
+    # carries an MIT text (required for redistribution).
+    [[ -f "$stage/LICENSE-MIT" ]] || cp "$repo_root/LICENSES/meilisearch-MIT.txt" "$stage/LICENSE-MIT"
+    [[ -f "$stage/LICENSE" ]]     || cp "$repo_root/LICENSES/meilisearch-MIT.txt" "$stage/LICENSE"
+    require_files "$stage" bin/meilisearch
+    ;;
+
   *)
     echo "build-service.sh: unhandled service '$service'" >&2
     exit 1

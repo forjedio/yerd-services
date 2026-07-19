@@ -40,7 +40,7 @@ host_arch() {
 
 # canonical_service: normalize the input service id.
 #   - `valkey` is the friendly alias for the `redis` slot (the redis slot ships Valkey).
-#   - redis|mysql|mariadb|postgres pass through unchanged.
+#   - redis|mysql|mariadb|postgres|meilisearch pass through unchanged.
 #   - anything else is rejected, so a typo fails loudly instead of producing a
 #     mis-named artifact the daemon will never see.
 # All filenames are built from the canonical id, so the artifact is always
@@ -48,9 +48,9 @@ host_arch() {
 canonical_service() {
   local in="${1:-}"
   case "$in" in
-    valkey|redis)            echo redis ;;
-    mysql|mariadb|postgres)  echo "$in" ;;
-    *) echo "lib.sh: unknown service '$in' (want valkey|redis|mysql|mariadb|postgres)" >&2; return 1 ;;
+    valkey|redis)                        echo redis ;;
+    mysql|mariadb|postgres|meilisearch)  echo "$in" ;;
+    *) echo "lib.sh: unknown service '$in' (want valkey|redis|mysql|mariadb|postgres|meilisearch)" >&2; return 1 ;;
   esac
 }
 
@@ -407,6 +407,21 @@ ensure_cmake() {
   cmaj="${cv%%.*}"; cmin="${cv##*.}"
   [[ "${cmaj:-0}" -gt 3 || ( "${cmaj:-0}" -eq 3 && "${cmin:-0}" -ge 15 ) ]] \
     || { echo "ensure_cmake: cmake >= 3.15 required (found ${cv:-none})" >&2; return 1; }
+}
+
+# ensure_rust: make sure `cargo` is on PATH so the meilisearch source build (a Rust project) can
+# run. The meilisearch source tree pins its exact toolchain via rust-toolchain.toml, so once a
+# rustup-managed cargo is reachable the right compiler is fetched automatically at build time — we
+# do NOT pin a channel here (that would fight the upstream pin). GitHub runners preinstall
+# rustup+cargo; this only fixes up PATH for a bare host that has cargo under the standard rustup
+# home. Returns non-zero if cargo still can't be found (the caller fails loudly).
+ensure_rust() {
+  command -v cargo >/dev/null 2>&1 && return 0
+  local c
+  for c in "${CARGO_HOME:-}/bin/cargo" "$HOME/.cargo/bin/cargo"; do
+    [[ -n "$c" && -x "$c" ]] && { PATH="$(dirname "$c"):$PATH"; export PATH; return 0; }
+  done
+  command -v cargo >/dev/null 2>&1
 }
 
 # ensure_mariadb_runtime_deps: install the linux-systemd bintar's runtime chain (root-aware) so

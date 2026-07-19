@@ -331,6 +331,47 @@ SQL
     "$bin/pg_ctl" -D "$data" -m fast stop
     ;;
 
+  meilisearch)
+    # Smoke the FINAL packaged binary: it must exist, be executable, start on a loopback port with a
+    # throwaway db, and report healthy. Extraction above already proved relocatability (runs from an
+    # arbitrary dir). Health contract: GET /health -> 200 with a body containing {"status":"available"}.
+    [[ -x "$bin/meilisearch" ]] || { echo "meilisearch: bin/meilisearch missing or not executable" >&2; exit 1; }
+    logf="$extract/meilisearch.log"
+    healthf="$extract/health.json"
+    # --env development + --no-analytics: no master key required and no telemetry. db-path lives under
+    # the throwaway extract dir, so it's reaped with everything else on cleanup.
+    "$bin/meilisearch" \
+      --http-addr "127.0.0.1:$port" \
+      --db-path "$data" \
+      --env development \
+      --no-analytics >"$logf" 2>&1 &
+    srv_pid=$!
+    # Bounded poll (default 60 tries * 0.5s = 30s; MEILI_HEALTH_TRIES overrides for tests). Bail early
+    # if the server process dies. Capture the HTTP status without -f so a non-2xx still yields the code.
+    tries="${MEILI_HEALTH_TRIES:-60}"
+    ok=""
+    for (( i=0; i<tries; i++ )); do
+      code="$(curl -sS -o "$healthf" -w '%{http_code}' "http://127.0.0.1:$port/health" 2>/dev/null || echo 000)"
+      if [[ "$code" == "200" ]]; then ok=1; break; fi
+      kill -0 "$srv_pid" 2>/dev/null || { echo "meilisearch: server exited before becoming healthy" >&2; break; }
+      sleep 0.5
+    done
+    if [[ -z "$ok" ]]; then
+      echo "meilisearch: /health did not return HTTP 200 within ${tries} tries" >&2
+      echo "---- meilisearch log ----" >&2; cat "$logf" >&2 2>/dev/null || true
+      exit 1
+    fi
+    # Require the availability signal in the JSON body. Whitespace-tolerant so it holds regardless
+    # of how the server serializes the object ({"status":"available"} or {"status": "available"}).
+    if ! grep -Eq '"status"[[:space:]]*:[[:space:]]*"available"' "$healthf"; then
+      echo "meilisearch: /health returned 200 but body lacks {\"status\":\"available\"}:" >&2
+      cat "$healthf" >&2 2>/dev/null || true
+      echo "---- meilisearch log ----" >&2; cat "$logf" >&2 2>/dev/null || true
+      exit 1
+    fi
+    # Graceful shutdown handled by the EXIT trap (SIGTERM -> meilisearch exits cleanly, then reaped).
+    ;;
+
   *)
     echo "smoke-test.sh: unhandled service '$service'" >&2
     exit 1
