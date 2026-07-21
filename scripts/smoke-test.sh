@@ -372,6 +372,33 @@ SQL
     # Graceful shutdown handled by the EXIT trap (SIGTERM -> meilisearch exits cleanly, then reaped).
     ;;
 
+  versitygw)
+    # Smoke the FINAL packaged binary: it must exist, be executable, start on a loopback
+    # port over a throwaway posix data root, and answer its unauthenticated health probe.
+    # Extraction above already proved relocatability. versitygw refuses to start without
+    # root credentials, so pass throwaway ones. Health contract: GET /health -> 200.
+    [[ -x "$bin/versitygw" ]] || { echo "versitygw: bin/versitygw missing or not executable" >&2; exit 1; }
+    logf="$extract/versitygw.log"
+    mkdir -p "$data"
+    ROOT_ACCESS_KEY=smoke ROOT_SECRET_ACCESS_KEY=smokesmokesmoke \
+      "$bin/versitygw" --port "127.0.0.1:$port" --health /health posix "$data" >"$logf" 2>&1 &
+    srv_pid=$!
+    tries="${VGW_HEALTH_TRIES:-60}"
+    ok=""
+    for (( i=0; i<tries; i++ )); do
+      code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/health" 2>/dev/null || echo 000)"
+      if [[ "$code" == "200" ]]; then ok=1; break; fi
+      kill -0 "$srv_pid" 2>/dev/null || { echo "versitygw: server exited before becoming healthy" >&2; break; }
+      sleep 0.5
+    done
+    if [[ -z "$ok" ]]; then
+      echo "versitygw: /health did not return HTTP 200 within ${tries} tries" >&2
+      echo "---- versitygw log ----" >&2; cat "$logf" >&2 2>/dev/null || true
+      exit 1
+    fi
+    # Graceful shutdown handled by the EXIT trap (SIGTERM -> versitygw exits, then reaped).
+    ;;
+
   *)
     echo "smoke-test.sh: unhandled service '$service'" >&2
     exit 1
