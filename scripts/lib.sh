@@ -48,9 +48,9 @@ host_arch() {
 canonical_service() {
   local in="${1:-}"
   case "$in" in
-    valkey|redis)                        echo redis ;;
-    mysql|mariadb|postgres|meilisearch)  echo "$in" ;;
-    *) echo "lib.sh: unknown service '$in' (want valkey|redis|mysql|mariadb|postgres|meilisearch)" >&2; return 1 ;;
+    valkey|redis)                                  echo redis ;;
+    mysql|mariadb|postgres|meilisearch|versitygw)  echo "$in" ;;
+    *) echo "lib.sh: unknown service '$in' (want valkey|redis|mysql|mariadb|postgres|meilisearch|versitygw)" >&2; return 1 ;;
   esac
 }
 

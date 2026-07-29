@@ -22,7 +22,7 @@ on:
         type: choice
         required: true
         default: valkey
-        options: [valkey, redis, mysql, mariadb, postgres, meilisearch]
+        options: [valkey, redis, mysql, mariadb, postgres, meilisearch, versitygw]
       version:
         description: the published label users install (e.g. 8, 8.4, 16)
         type: string
@@ -135,6 +135,12 @@ jobs:
           # Windows-from-source build is a separate effort), so drop windows-* from its candidate set.
           # A leg would otherwise hit build-service.sh's windows path, which doesn't handle meilisearch.
           if [[ "${{ inputs.service }}" == "meilisearch" ]]; then
+            all="$(jq -c '[.[] | select(.target | startswith("windows") | not)]' <<<"$all")"
+          fi
+          # versitygw repackages upstream's prebuilt static Go binaries. Yerd consumes only
+          # linux/macos, and build-service.sh's windows path doesn't handle it, so drop the
+          # windows leg (upstream does publish Windows binaries if that changes later).
+          if [[ "${{ inputs.service }}" == "versitygw" ]]; then
             all="$(jq -c '[.[] | select(.target | startswith("windows") | not)]' <<<"$all")"
           fi
           if [[ "${{ inputs.targets }}" == "all" ]]; then

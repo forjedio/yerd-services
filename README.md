@@ -27,6 +27,7 @@ It is intentionally **isolated** from the main app:
 | `postgres` | PostgreSQL (PostgreSQL License) | 2 | ✅ implemented (build from source) |
 | `mariadb`  | MariaDB (GPLv2) | 3 | ✅ implemented (repackage x86_64 + build from source for ARM/macOS) |
 | `meilisearch` | Meilisearch **Community Edition** (MIT) | 4 | ✅ implemented (build from source, Linux/macOS) |
+| `versitygw` | [versitygw](https://github.com/versity/versitygw) S3 gateway (Apache-2.0) | _(rolling)_ | ✅ implemented (repackage prebuilt binary, Linux/macOS) |
 
 The `redis` slot ships **[Valkey](https://github.com/valkey-io/valkey)** (Linux Foundation,
 BSD-3, wire-compatible) because Redis 7.4+ is SSPL/RSALv2 (redistribution-restricted).
@@ -65,8 +66,8 @@ This is the entire coupling with `forjedio/yerd`. The consumer there
 this shape.
 
 **Filename:** `<service-id>-<version>-<os>-<arch>.tar.gz`
-- `service-id ∈ redis | mysql | mariadb | postgres | meilisearch` (the `redis` slot is served by
-  Valkey on Linux/macOS, and by the native MSVC Redis port on Windows — see below)
+- `service-id ∈ redis | mysql | mariadb | postgres | meilisearch | versitygw` (the `redis` slot is
+  served by Valkey on Linux/macOS, and by the native MSVC Redis port on Windows — see below)
 - `os ∈ linux | macos | windows`, `arch ∈ x86_64 | aarch64` (Windows is `x86_64` only)
 - examples: `redis-8-linux-x86_64.tar.gz`, `postgres-16-macos-aarch64.tar.gz`,
   `mysql-8.4.9-windows-x86_64.tar.gz`, `meilisearch-1.49.0-linux-aarch64.tar.gz`
@@ -84,6 +85,7 @@ and points data/socket/port at user paths via config, never compiled-in defaults
 | `mariadb`  | `mariadbd` | `mariadb`, `mariadb-install-db`, `mariadb-dump` |
 | `postgres` | `postgres` | `initdb`, `pg_ctl`, `psql`, `createdb`, `pg_dump`, `pg_dumpall`, `pg_restore` |
 | `meilisearch` | `meilisearch` | _(single self-contained binary; no client/init tools)_ |
+| `versitygw` | `versitygw` | _(single self-contained binary; no client/init tools)_ |
 
 **Windows differs** from the table above:
 - Executables carry `.exe` (`mysqld.exe`, `postgres.exe`, …). Only the **server binary** is
@@ -160,6 +162,7 @@ the escape hatch is to move `SERVICES_BASE_URL` to a CDN while keeping this arti
 | `postgres` | _(label)_ | [postgresql.org](https://ftp.postgresql.org/pub/source/) source `<upstream>` (e.g. 17.10) | build from source | `./configure --without-icu --without-readline --without-zlib --without-libxml` (no compressed `pg_dump`); macOS made relocatable. Also bundles a curated set of contrib extensions + **pgvector** (`PGVECTOR_UPSTREAM`, default `v0.8.5`) — see [Bundled extensions](#bundled-extensions) |
 | `mariadb` | _(label)_ | [archive.mariadb.org](https://archive.mariadb.org/) `<upstream>` (e.g. 11.8.8 LTS) | repackage (linux-x86_64) / build from source (ARM Linux + macOS) | MariaDB ships only a `linux-systemd-x86_64` bintar; CMake build for the rest (`-DWITH_SSL=system`, heavy plugins trimmed). `bin/{mariadbd,mariadb,mariadb-install-db,my_print_defaults,mariadb-dump,…}` + `lib/`+`share/`; made relocatable + self-contained |
 | `meilisearch` | _(label)_ | [Meilisearch](https://github.com/meilisearch/meilisearch) source tag `<upstream>` (e.g. `v1.49.0`) | build from source (Linux/macOS) | **Community Edition** via `cargo build --release --locked -p meilisearch` (default features — the `enterprise` feature is **not** enabled, so BUSL-1.1 EE code is compiled out; MIT-only). Rust toolchain auto-selected from the source's `rust-toolchain.toml`. Single self-contained `bin/meilisearch` (no `lib/`). **No Windows or `macos-x86_64` leg** — see [Platform matrix](#platform-matrix) |
+| `versitygw` | _(label)_ | [versitygw](https://github.com/versity/versitygw) release tag `<upstream>` (e.g. `1.7.0`) | repackage prebuilt (Linux/macOS) | **Pure repackage, no toolchain**: download upstream's official static Go binary (`versitygw_v<up>_<Darwin\|Linux>_<x86_64\|arm64>.tar.gz`), lift out `bin/versitygw`, ship its `LICENSE` + `NOTICE` (Apache-2.0). Single self-contained binary (no `lib/`). **No Windows leg** — see [Platform matrix](#platform-matrix) |
 
 **Windows (`windows-x86_64`)** — all repackaged from official vendor zips (no service has a
 native Windows ARM64 build, so Windows is x86_64-only; Windows-on-ARM runs x64 via emulation):
@@ -367,7 +370,8 @@ yerd-services/
 │   ├── gdal-MIT.txt                    #   "   (MIT)
 │   ├── json-c-MIT.txt                  #   "   (MIT)
 │   ├── protobuf-c-BSD-2-Clause.txt     #   "   (BSD-2)
-│   └── meilisearch-MIT.txt             # Meilisearch Community Edition (MIT)
+│   ├── meilisearch-MIT.txt             # Meilisearch Community Edition (MIT)
+│   └── versitygw-Apache-2.0.txt        # versitygw S3 gateway (Apache-2.0; backfill only)
 │                                       # TimescaleDB notices are copied from its source tree at
 │                                       # build time (LICENSE-timescaledb*, NOTICE-timescaledb)
 ├── scripts/
