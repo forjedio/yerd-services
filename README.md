@@ -26,8 +26,8 @@ It is intentionally **isolated** from the main app:
 | `mysql`    | Oracle MySQL (GPLv2) | 2 | ✅ implemented (repackage generic tarball) |
 | `postgres` | PostgreSQL (PostgreSQL License) | 2 | ✅ implemented (build from source) |
 | `mariadb`  | MariaDB (GPLv2) | 3 | ✅ implemented (repackage x86_64 + build from source for ARM/macOS) |
-| `meilisearch` | Meilisearch **Community Edition** (MIT) | 4 | ✅ implemented (build from source, Linux/macOS) |
-| `versitygw` | [versitygw](https://github.com/versity/versitygw) S3 gateway (Apache-2.0) | _(rolling)_ | ✅ implemented (repackage prebuilt binary, Linux/macOS) |
+| `meilisearch` | Meilisearch **Community Edition** (MIT) | 4 | ✅ implemented (build from source, all platforms) |
+| `versitygw` | [versitygw](https://github.com/versity/versitygw) S3 gateway (Apache-2.0) | _(rolling)_ | ✅ implemented (repackage prebuilt binary, all platforms) |
 
 The `redis` slot ships **[Valkey](https://github.com/valkey-io/valkey)** (Linux Foundation,
 BSD-3, wire-compatible) because Redis 7.4+ is SSPL/RSALv2 (redistribution-restricted).
@@ -161,8 +161,8 @@ the escape hatch is to move `SERVICES_BASE_URL` to a CDN while keeping this arti
 | `mysql` | _(label)_ | [Oracle MySQL](https://dev.mysql.com/downloads/mysql/) generic tarball `<upstream>` (e.g. 8.4.9 LTS) | repackage | `bin/{mysqld,mysql,mysqld_safe,mysqldump}` + bundled `lib/`+`share/`; macOS dylib install-names made relocatable |
 | `postgres` | _(label)_ | [postgresql.org](https://ftp.postgresql.org/pub/source/) source `<upstream>` (e.g. 17.10) | build from source | `./configure --without-icu --without-readline --without-zlib --without-libxml` (no compressed `pg_dump`); macOS made relocatable. Also bundles a curated set of contrib extensions + **pgvector** (`PGVECTOR_UPSTREAM`, default `v0.8.5`) — see [Bundled extensions](#bundled-extensions) |
 | `mariadb` | _(label)_ | [archive.mariadb.org](https://archive.mariadb.org/) `<upstream>` (e.g. 11.8.8 LTS) | repackage (linux-x86_64) / build from source (ARM Linux + macOS) | MariaDB ships only a `linux-systemd-x86_64` bintar; CMake build for the rest (`-DWITH_SSL=system`, heavy plugins trimmed). `bin/{mariadbd,mariadb,mariadb-install-db,my_print_defaults,mariadb-dump,…}` + `lib/`+`share/`; made relocatable + self-contained |
-| `meilisearch` | _(label)_ | [Meilisearch](https://github.com/meilisearch/meilisearch) source tag `<upstream>` (e.g. `v1.49.0`) | build from source (Linux/macOS) | **Community Edition** via `cargo build --release --locked -p meilisearch` (default features — the `enterprise` feature is **not** enabled, so BUSL-1.1 EE code is compiled out; MIT-only). Rust toolchain auto-selected from the source's `rust-toolchain.toml`. Single self-contained `bin/meilisearch` (no `lib/`). **No Windows or `macos-x86_64` leg** — see [Platform matrix](#platform-matrix) |
-| `versitygw` | _(label)_ | [versitygw](https://github.com/versity/versitygw) release tag `<upstream>` (e.g. `1.7.0`) | repackage prebuilt (Linux/macOS) | **Pure repackage, no toolchain**: download upstream's official static Go binary (`versitygw_v<up>_<Darwin\|Linux>_<x86_64\|arm64>.tar.gz`), lift out `bin/versitygw`, ship its `LICENSE` + `NOTICE` (Apache-2.0). Single self-contained binary (no `lib/`). **No Windows leg** — see [Platform matrix](#platform-matrix) |
+| `meilisearch` | _(label)_ | [Meilisearch](https://github.com/meilisearch/meilisearch) source tag `<upstream>` (e.g. `v1.49.0`) | build from source (all platforms) | **Community Edition** via `cargo build --release --locked -p meilisearch` (default features — the `enterprise` feature is **not** enabled, so BUSL-1.1 EE code is compiled out; MIT-only). Rust toolchain auto-selected from the source's `rust-toolchain.toml`. Single self-contained `bin/meilisearch` (`bin/meilisearch.exe` on Windows, where the VC++ runtime is bundled; no `lib/`). **No `macos-x86_64` leg** — see [Platform matrix](#platform-matrix) |
+| `versitygw` | _(label)_ | [versitygw](https://github.com/versity/versitygw) release tag `<upstream>` (e.g. `1.7.0`) | repackage prebuilt (all platforms) | **Pure repackage, no toolchain**: download upstream's official static Go binary (`versitygw_v<up>_<Darwin\|Linux>_<x86_64\|arm64>.tar.gz`; `…_Windows_x86_64.zip` on Windows), lift out `bin/versitygw` (`bin/versitygw.exe` on Windows), ship its `LICENSE` + `NOTICE` (Apache-2.0). Single self-contained binary (no `lib/`). **Windows note:** the exe imports only `kernel32.dll` (static Go), so nothing is bundled, but its posix backend needs `--sidecar` at runtime — see the Windows table below |
 
 **Windows (`windows-x86_64`)** — all repackaged from official vendor zips (no service has a
 native Windows ARM64 build, so Windows is x86_64-only; Windows-on-ARM runs x64 via emulation):
@@ -173,9 +173,13 @@ native Windows ARM64 build, so Windows is x86_64-only; Windows-on-ARM runs x64 v
 | `mysql` | [Oracle MySQL](https://dev.mysql.com/downloads/mysql/) `mysql-<upstream>-winx64.zip` | repackage `bin/` (exes + sibling DLLs) + `share/` + `lib/plugin/`; no `mysqld_safe` |
 | `mariadb` | [archive.mariadb.org](https://archive.mariadb.org/) `mariadb-<upstream>-winx64.zip` | repackage `bin/` + `share/`; init tool `mariadb-install-db.exe`/`mysql_install_db.exe` |
 | `postgres` | [EDB](https://www.enterprisedb.com/download-postgresql-binaries) `postgresql-<upstream>-<N>-windows-x64-binaries.zip` | repackage `pgsql/{bin,lib,share}`; the build-number `<N>` is set via `postgres_win_buildno` (else probed). The EDB zip already carries the contrib extensions (shipped via the verbatim `lib/`+`share/` copy); **pgvector is not bundled on Windows** — see [Bundled extensions](#bundled-extensions) |
+| `meilisearch` | _(from source)_ [Meilisearch](https://github.com/meilisearch/meilisearch) source tag `<upstream>` | **Not repackaged** — built from Rust source with `cargo build --release --locked -p meilisearch` on the windows runner, identical CE recipe to the Unix legs, emitting `bin/meilisearch.exe`. Rust's MSVC target dynamically links the VC++ runtime, so those DLLs are bundled into `bin/` and pass `windows_self_contain_gate` |
+| `versitygw` | [versitygw](https://github.com/versity/versitygw) `versitygw_v<up>_Windows_x86_64.zip` | repackage the single `bin/versitygw.exe`. It is a **static Go binary** importing only `kernel32.dll`, so no VC++ runtime is bundled (the gate still runs and passes). **Runtime divergence:** versitygw's posix backend stores S3 object metadata in POSIX extended attributes, which NTFS lacks — on Windows it must be launched with `--sidecar <dir>` (metadata in a directory) or `--nometa`; the daemon must pass this for Windows installs. The smoke test exercises the `--sidecar` path |
 
-All Windows artifacts bundle the VC++ runtime DLLs into `bin/` and pass
-`windows_self_contain_gate` (a `dumpbin -dependents` check, mandatory in CI). The UCRT
+Every Windows artifact that links the VC++ runtime bundles those DLLs into `bin/`, and **all**
+pass `windows_self_contain_gate` (a `dumpbin -dependents` check, mandatory in CI). The lone
+exception to bundling is `versitygw` — a static Go exe that imports only system DLLs, so it needs
+nothing bundled and passes the gate with an empty bin/ DLL set. The UCRT
 (`ucrtbase`/`api-ms-win-*`) ships with Windows 10+ and is treated as system. No Cygwin is
 used (its `cygwin1.dll` is GPLv3). Redistribution of the bundled VC++ runtime DLLs is
 covered by the folder-level grant for `VC\Redist` (https://aka.ms/vs/17/redist.txt), not a
@@ -252,19 +256,20 @@ built **from source** on Linux and macOS.
   ```sh
   gh workflow run release.yml \
     -f action=build -f service=meilisearch -f version=1.49.0 -f upstream=v1.49.0
-  #  → builds linux-x86_64, linux-aarch64, macos-aarch64; uploads meilisearch-1.49.0-*.tar.gz;
-  #    refreshes services.json. Repoint the label by rebuilding the same version with a new tag.
+  #  → builds linux-x86_64, linux-aarch64, macos-aarch64, windows-x86_64; uploads
+  #    meilisearch-1.49.0-*.tar.gz; refreshes services.json. Repoint the label by rebuilding the
+  #    same version with a new tag. Add `-f targets=windows-x86_64` to rebuild just one platform.
   gh workflow run release.yml -f action=remove -f service=meilisearch -f version=1.49.0
   ```
-- **Intentionally omitted platforms.**
-  - **`windows-x86_64`** — the daemon requests only Linux/macOS for meilisearch, and a native
-    Windows-from-source build is a separate effort; `set-matrix` drops the Windows leg for this
-    service (selecting `targets=windows-x86_64` for meilisearch fails loudly with an empty matrix).
+- **Windows.** Built from the same Rust source on the `windows-latest` runner (emitting
+  `bin/meilisearch.exe`); Rust's MSVC target dynamically links the VC++ runtime, so those DLLs are
+  bundled into `bin/` and pass `windows_self_contain_gate`, matching every other Windows artifact.
+- **Intentionally omitted platform.**
   - **`macos-x86_64`** — no Intel macOS runner exists (GitHub retired `macos-13` in Dec 2025), the
     same floor as every other service here.
 
-  These match the repo's existing platform floors — building meilisearch from source on the same
-  native runners as Valkey/Postgres neither raises the glibc floor nor the macOS deployment target.
+  Building meilisearch from source on the same native runners as Valkey/Postgres neither raises the
+  glibc floor nor the macOS deployment target.
 
 ## Bundled extensions
 
@@ -405,8 +410,15 @@ hardware too. Building from source for ARM Windows is deferred. **Daemon note:**
 `current_os_arch()` currently reject Windows); publishing them here is forward-compatible
 (existing daemons only request their own platform token).
 
-**`meilisearch` is Linux/macOS only** (`linux-x86_64`, `linux-aarch64`, `macos-aarch64`). Its
-`set-matrix` step drops the Windows leg (no native Windows-from-source recipe; the daemon requests
-only Linux/macOS for it), and `macos-x86_64` is omitted for the same no-Intel-runner reason as
-every other service. Built from Rust source on the same native runners as Valkey/Postgres, so it
-shares their glibc/macOS floors — no deployment target is silently raised.
+**Every service now covers all four targets** (`linux-x86_64`, `linux-aarch64`, `macos-aarch64`,
+`windows-x86_64`); `macos-x86_64` is the only universally-omitted target (no Intel runner). The
+last two Windows gaps were closed by building `meilisearch` from Rust source on `windows-latest`
+(emitting `meilisearch.exe`) and repackaging `versitygw`'s official Windows binary — so `set-matrix`
+no longer drops any per-service Windows leg. `meilisearch`/`versitygw` build from source / repackage
+on the same native runners, so no glibc floor or macOS deployment target is silently raised.
+
+**`versitygw` on Windows** ships a working exe but its posix backend can't use NTFS for S3 metadata
+(no extended attributes); it must be launched with `--sidecar <dir>` (or `--nometa`). This is a
+**daemon-side runtime prerequisite** for Windows versitygw installs — the label/install path itself
+needs no change, but the launcher must add `--sidecar` on Windows. The build's smoke test starts it
+exactly that way, so it validates the invocation the daemon will use.

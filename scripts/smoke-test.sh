@@ -48,7 +48,7 @@ cleanup() {
   # fires in CI (avoid taskkilling a dev box's own engines by image name).
   if [[ "$OS" == windows && -n "${GITHUB_ACTIONS:-}${CI:-}" ]]; then
     local img
-    for img in redis-server.exe mysqld.exe mariadbd.exe postgres.exe; do
+    for img in redis-server.exe mysqld.exe mariadbd.exe postgres.exe meilisearch.exe versitygw.exe; do
       taskkill //IM "$img" //F >/dev/null 2>&1 || true
     done
   fi
@@ -181,6 +181,73 @@ SQL
       [[ "$rt" == "42" ]] || { echo "postgres: backup/restore roundtrip got '$rt'" >&2; exit 1; }
       "$bin/pg_dumpall.exe" --version >/dev/null
       "$bin/pg_ctl.exe" -D "$data" -m fast stop
+      ;;
+
+    meilisearch)
+      # Same TCP /health contract as the Unix leg (meilisearch has no unix-socket path anyway),
+      # just the .exe binary. Health: GET /health -> 200 with a body containing {"status":"available"}.
+      [[ -f "$bin/meilisearch.exe" ]] || { echo "meilisearch: bin/meilisearch.exe missing" >&2; exit 1; }
+      logf="$extract/meilisearch.log"
+      healthf="$extract/health.json"
+      "$bin/meilisearch.exe" \
+        --http-addr "127.0.0.1:$port" \
+        --db-path "$data" \
+        --env development \
+        --no-analytics >"$logf" 2>&1 &
+      srv_pid=$!
+      tries="${MEILI_HEALTH_TRIES:-60}"
+      ok=""
+      for (( i=0; i<tries; i++ )); do
+        code="$(curl -sS -o "$healthf" -w '%{http_code}' "http://127.0.0.1:$port/health" 2>/dev/null || echo 000)"
+        if [[ "$code" == "200" ]]; then ok=1; break; fi
+        kill -0 "$srv_pid" 2>/dev/null || { echo "meilisearch: server exited before becoming healthy" >&2; break; }
+        sleep 0.5
+      done
+      if [[ -z "$ok" ]]; then
+        echo "meilisearch: /health did not return HTTP 200 within ${tries} tries" >&2
+        echo "---- meilisearch log ----" >&2; cat "$logf" >&2 2>/dev/null || true
+        exit 1
+      fi
+      if ! grep -Eq '"status"[[:space:]]*:[[:space:]]*"available"' "$healthf"; then
+        echo "meilisearch: /health returned 200 but body lacks {\"status\":\"available\"}:" >&2
+        cat "$healthf" >&2 2>/dev/null || true
+        echo "---- meilisearch log ----" >&2; cat "$logf" >&2 2>/dev/null || true
+        exit 1
+      fi
+      ;;
+
+    versitygw)
+      # versitygw refuses to start without root credentials, so pass throwaway ones. TWO
+      # Windows-specific twists vs the Unix leg:
+      #  1. The posix backend stores S3 object metadata in extended attributes, which NTFS does not
+      #     provide ("xattrs are not supported on this platform"), so it must run with a --sidecar
+      #     metadata directory instead. A real Windows deployment needs the same (see README).
+      #  2. Git Bash rewrites a bare "/health" argument into a Windows path when handing it to a
+      #     native .exe, which would silently break the health route — exclude just that arg from
+      #     MSYS path conversion. (The daemon invokes the exe directly and is unaffected; the posix
+      #     data/sidecar paths still convert normally, which versitygw accepts.)
+      [[ -f "$bin/versitygw.exe" ]] || { echo "versitygw: bin/versitygw.exe missing" >&2; exit 1; }
+      logf="$extract/versitygw.log"
+      meta="$extract/meta"
+      mkdir -p "$data" "$meta"
+      MSYS2_ARG_CONV_EXCL='/health' \
+      ROOT_ACCESS_KEY=smoke ROOT_SECRET_ACCESS_KEY=smokesmokesmoke \
+        "$bin/versitygw.exe" --port "127.0.0.1:$port" --health /health \
+          posix --sidecar "$meta" "$data" >"$logf" 2>&1 &
+      srv_pid=$!
+      tries="${VGW_HEALTH_TRIES:-60}"
+      ok=""
+      for (( i=0; i<tries; i++ )); do
+        code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/health" 2>/dev/null || echo 000)"
+        if [[ "$code" == "200" ]]; then ok=1; break; fi
+        kill -0 "$srv_pid" 2>/dev/null || { echo "versitygw: server exited before becoming healthy" >&2; break; }
+        sleep 0.5
+      done
+      if [[ -z "$ok" ]]; then
+        echo "versitygw: /health did not return HTTP 200 within ${tries} tries" >&2
+        echo "---- versitygw log ----" >&2; cat "$logf" >&2 2>/dev/null || true
+        exit 1
+      fi
       ;;
 
     *)

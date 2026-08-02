@@ -130,19 +130,10 @@ jobs:
       - id: gen
         run: |
           all='[{"runner":"ubuntu-latest","target":"linux-x86_64"},{"runner":"ubuntu-24.04-arm","target":"linux-aarch64"},{"runner":"macos-14","target":"macos-aarch64"},{"runner":"windows-latest","target":"windows-x86_64"}]'
-          # Per-service platform floor: meilisearch is built from Rust source on the native runners
-          # and has no Windows leg here (the daemon requests only linux/macos for it, and a native
-          # Windows-from-source build is a separate effort), so drop windows-* from its candidate set.
-          # A leg would otherwise hit build-service.sh's windows path, which doesn't handle meilisearch.
-          if [[ "${{ inputs.service }}" == "meilisearch" ]]; then
-            all="$(jq -c '[.[] | select(.target | startswith("windows") | not)]' <<<"$all")"
-          fi
-          # versitygw repackages upstream's prebuilt static Go binaries. Yerd consumes only
-          # linux/macos, and build-service.sh's windows path doesn't handle it, so drop the
-          # windows leg (upstream does publish Windows binaries if that changes later).
-          if [[ "${{ inputs.service }}" == "versitygw" ]]; then
-            all="$(jq -c '[.[] | select(.target | startswith("windows") | not)]' <<<"$all")"
-          fi
+          # Every service now covers all four platforms: meilisearch builds from Rust source on
+          # windows-latest (emitting meilisearch.exe) and versitygw repackages upstream's prebuilt
+          # Windows binary — so there is no per-service Windows drop here anymore. A single target
+          # can still be rebuilt in isolation via the `targets` input below (e.g. windows-x86_64).
           if [[ "${{ inputs.targets }}" == "all" ]]; then
             inc="$(jq -c '.' <<<"$all")"
           else
