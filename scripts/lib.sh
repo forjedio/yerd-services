@@ -705,6 +705,8 @@ windows_self_contain_gate() {
       # is deliberately NOT here — it must be bundled, so it falls through to the
       # bundled-in-bin/ check below (catches the "installed on the runner but not on a
       # clean user box" case, the Windows analogue of the macOS-brew gate).
+      # (pdh.dll = Performance Data Helper, a System32 component present on all Windows;
+      # meilisearch.exe pulls it in via the `sysinfo` crate — it is NOT redistributable/bundleable.)
       case "$base" in
         kernel32.dll|kernelbase.dll|kernel.appcore.dll|ntdll.dll|advapi32.dll|sechost.dll|\
         rpcrt4.dll|user32.dll|win32u.dll|gdi32.dll|gdi32full.dll|shell32.dll|shlwapi.dll|\
@@ -712,7 +714,7 @@ windows_self_contain_gate() {
         ws2_32.dll|wsock32.dll|mswsock.dll|dnsapi.dll|iphlpapi.dll|winhttp.dll|wininet.dll|\
         secur32.dll|sspicli.dll|crypt32.dll|bcrypt.dll|bcryptprimitives.dll|ncrypt.dll|\
         cryptbase.dll|cryptsp.dll|netapi32.dll|authz.dll|userenv.dll|version.dll|winmm.dll|\
-        psapi.dll|setupapi.dll|cfgmgr32.dll|powrprof.dll|profapi.dll|normaliz.dll|\
+        psapi.dll|setupapi.dll|cfgmgr32.dll|powrprof.dll|pdh.dll|profapi.dll|normaliz.dll|\
         dbghelp.dll|dbgcore.dll|imagehlp.dll|msvcrt.dll|ucrtbase.dll|\
         wldap32.dll|wtsapi32.dll|wintrust.dll|cabinet.dll|mpr.dll|samlib.dll|dsrole.dll|\
         api-ms-win-*|ext-ms-*) continue ;;
