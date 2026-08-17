@@ -363,6 +363,60 @@ if [[ "$OS" == windows ]]; then
         bin/createdb.exe bin/pg_dump.exe bin/pg_dumpall.exe bin/pg_restore.exe
       ;;
 
+    meilisearch)
+      # Meilisearch Community Edition, built FROM SOURCE with cargo — the same recipe as the Unix
+      # legs (the source tree pins its exact toolchain via rust-toolchain.toml, which rustup honors),
+      # just emitting meilisearch.exe. No `--features enterprise` -> the BUSL-1.1 EE code is compiled
+      # out and this is the MIT Community Edition (see the Unix branch for the full CE rationale).
+      # Rust's MSVC target dynamically links the VC++ runtime (vcruntime140/msvcp140/…), so bundle it
+      # into bin/ and gate self-containment exactly like the repackaged MSVC engines.
+      ensure_rust || { echo "meilisearch(windows): cargo/rust toolchain unavailable" >&2; exit 1; }
+      meili_tag="v${upstream#v}"
+      fetch_to "https://github.com/meilisearch/meilisearch/archive/refs/tags/${meili_tag}.tar.gz" \
+        "$work/meili.tar.gz"
+      mkdir -p "$work/meili"
+      tar xf "$work/meili.tar.gz" -C "$work/meili" --strip-components 1
+      jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+      ( cd "$work/meili" && cargo build --release --locked -p meilisearch -j "$jobs" )
+      cp "$work/meili/target/release/meilisearch.exe" "$stage/bin/meilisearch.exe"
+      # License staging (CE): SPDX explainer as LICENSE + the operative MIT text, copied verbatim
+      # from the built tag; fall back to the repo license home if the layout ever changes. No
+      # LICENSE-EE (no Business-Source code is present in a CE build).
+      [[ -f "$work/meili/LICENSE" ]]     && cp "$work/meili/LICENSE"     "$stage/LICENSE"
+      [[ -f "$work/meili/LICENSE-MIT" ]] && cp "$work/meili/LICENSE-MIT" "$stage/LICENSE-MIT"
+      [[ -f "$stage/LICENSE-MIT" ]] || cp "$repo_root/LICENSES/meilisearch-MIT.txt" "$stage/LICENSE-MIT"
+      [[ -f "$stage/LICENSE" ]]     || cp "$repo_root/LICENSES/meilisearch-MIT.txt" "$stage/LICENSE"
+      windows_bundle_runtime "$stage"
+      windows_self_contain_gate "$stage"
+      require_files "$stage" bin/meilisearch.exe
+      ;;
+
+    versitygw)
+      # versitygw ships an official prebuilt Windows binary, so — like the Unix legs — this is a
+      # PURE REPACKAGE (no toolchain). Upstream's Windows asset is a .zip (not the Unix .tar.gz),
+      #   versitygw_v<up>_Windows_x86_64.zip
+      # extracting to versitygw_v<up>_Windows_x86_64/{versitygw.exe,LICENSE,NOTICE,README.md} —
+      # flat, no bin/ dir, so vendor_root/win_stage_bin don't apply; locate the exe directly.
+      vgw_tag="v${upstream#v}"
+      url="https://github.com/versity/versitygw/releases/download/${vgw_tag}/versitygw_${vgw_tag}_Windows_x86_64.zip"
+      echo ">> versitygw(windows) source: $url"
+      fetch_to "$url" "$work/vgw.zip"
+      unzip_vendor "$work/vgw.zip" "$work/vgw"
+      exe="$(find "$work/vgw" -name 'versitygw.exe' -print -quit)"
+      [[ -n "$exe" ]] || { echo "versitygw(windows): versitygw.exe not found in zip" >&2; exit 1; }
+      cp "$exe" "$stage/bin/versitygw.exe"
+      # Apache-2.0: ship LICENSE + NOTICE verbatim from beside the exe (the shared license block
+      # below backfills LICENSE from LICENSES/ if the upstream layout ever drops it).
+      vgw_root="$(dirname "$exe")"
+      [[ -f "$vgw_root/LICENSE" ]] && cp "$vgw_root/LICENSE" "$stage/LICENSE"
+      [[ -f "$vgw_root/NOTICE" ]]  && cp "$vgw_root/NOTICE"  "$stage/NOTICE"
+      # versitygw.exe is a STATIC Go binary that imports only system DLLs (kernel32.dll), so unlike
+      # the MSVC engines there is NO VC++ runtime to bundle — the gate passes with an empty bin/ DLL
+      # set. Still run it to PROVE self-containment rather than assuming it.
+      windows_self_contain_gate "$stage"
+      require_files "$stage" bin/versitygw.exe
+      ;;
+
     *)
       echo "build-service.sh: unhandled service '$service' (windows)" >&2
       exit 1
@@ -614,6 +668,45 @@ case "$service" in
     require_files "$stage" bin/meilisearch
     ;;
 
+  versitygw)
+    # versitygw ships official prebuilt STATIC Go binaries per platform, so this is a
+    # pure repackage (no toolchain, unlike the from-source Rust/C services): download
+    # the upstream release archive for the host platform, lift out the single
+    # `versitygw` binary, and restage it under bin/. `upstream` is the exact release
+    # tag; accept it with or without the leading `v` and always fetch the v-tag.
+    #
+    # Upstream asset naming (github.com/versity/versitygw/releases):
+    #   versitygw_v<up>_<Uname>_<Arch>.tar.gz   Uname: Darwin|Linux   Arch: x86_64|arm64
+    # (Windows ships as a .zip and is handled by the windows branch above; this Unix path
+    # is Darwin/Linux only.)
+    vgw_tag="v${upstream#v}"
+    case "$OS" in
+      macos) vgw_os=Darwin ;;
+      linux) vgw_os=Linux ;;
+      *) echo "versitygw: unsupported os '$OS' (linux/macos only)" >&2; exit 1 ;;
+    esac
+    case "$ARCH" in
+      x86_64)  vgw_arch=x86_64 ;;
+      aarch64) vgw_arch=arm64 ;;
+      *) echo "versitygw: unsupported arch '$ARCH'" >&2; exit 1 ;;
+    esac
+    fetch_to \
+      "https://github.com/versity/versitygw/releases/download/${vgw_tag}/versitygw_${vgw_tag}_${vgw_os}_${vgw_arch}.tar.gz" \
+      "$work/vgw.tar.gz"
+    mkdir -p "$work/vgw"
+    tar xf "$work/vgw.tar.gz" -C "$work/vgw" --strip-components 1
+    cp "$work/vgw/versitygw" "$stage/bin/versitygw"
+    chmod +x "$stage/bin/versitygw"
+    # Static Go binary (no bundled lib/ needed); strip on Linux for size.
+    [[ "$OS" == linux ]] && strip "$stage/bin/versitygw" 2>/dev/null || true
+    # Apache-2.0 requires shipping the LICENSE *and* the NOTICE; both travel in the
+    # upstream archive. Copy them verbatim from the exact built tag; the license block
+    # below backfills LICENSE from LICENSES/ if the upstream layout ever changes.
+    [[ -f "$work/vgw/LICENSE" ]] && cp "$work/vgw/LICENSE" "$stage/LICENSE"
+    [[ -f "$work/vgw/NOTICE" ]]  && cp "$work/vgw/NOTICE"  "$stage/NOTICE"
+    require_files "$stage" bin/versitygw
+    ;;
+
   *)
     echo "build-service.sh: unhandled service '$service'" >&2
     exit 1
@@ -640,6 +733,9 @@ else
     mysql)    lic=mysql-GPLv2.txt ;;
     postgres) lic=postgresql-PostgreSQL-License.txt ;;
     mariadb)  lic=mariadb-GPLv2.txt ;;
+    # versitygw stages its own LICENSE + NOTICE from the upstream archive above; this
+    # only backfills LICENSE if that archive ever drops it.
+    versitygw) lic="$([[ -f "$stage/LICENSE" ]] && echo "" || echo versitygw-Apache-2.0.txt)" ;;
     *)        lic="" ;;
   esac
   if [[ -n "$lic" ]]; then
