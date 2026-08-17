@@ -1,0 +1,56 @@
+name: spike — windows redis from source
+
+# TEMPORARY SCAFFOLDING. Delete this file before the branch merges.
+#
+# Proves the Windows redis from-source build on a real windows-latest runner. release.yml's
+# only Windows entry point runs `finalize` and publishes to the live `services` release, and
+# there is no Windows machine available locally, so a build-only CI job is the sole way to
+# execute the recipe before committing to it.
+#
+# Triggered by PUSH to the spike branch, not workflow_dispatch: a `workflow_dispatch` trigger
+# only fires for workflow files present on the DEFAULT branch, which would leave this file
+# undispatchable from the feature branch it lives on.
+#
+# The build recipe lives ONLY in scripts/build-service.sh. This file is a caller — nothing is
+# duplicated here, so the spike proves the same code path the release will run.
+on:
+  push:
+    branches: ['spike/redis-win']
+
+permissions:
+  contents: read
+
+jobs:
+  spike:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      # Go / no-go question 1: does `pacman -S --noconfirm --needed gcc make` succeed
+      # unattended on the preinstalled C:\msys64, or does a runtime self-update force a
+      # shell restart? ensure_msys2 puts its diagnostics on stderr, so they land here.
+      # Question 2: is Redis's default -O3 sound, or is the reference project's -O0
+      # load-bearing? A miscompile shows up as a smoke failure below.
+      # Question 3: which msys-*.dll does the build actually import? The arm derives that
+      # set with ldd; if it is short one, windows_self_contain_gate names it in an
+      # `imports unbundled '<name>'` line — no separate dumpbin survey needed.
+      - name: Build the windows redis artifact from source
+        run: scripts/build-service.sh redis 7.2.15 7.2.15
+
+      # Proves version-label honesty, the forward-slash path form the daemon must use, and
+      # that MSYS2's fork() emulation actually completes a BGSAVE — all three are permanent
+      # assertions in smoke-test.sh, so the spike needs no bespoke checks of its own.
+      - name: Smoke-test it
+        run: scripts/smoke-test.sh redis dist/redis-7.2.15-windows-x86_64.tar.gz
+
+      # Keep the artifact for inspection. No release upload and no services.json touch —
+      # this workflow must never write to the live release.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spike-redis-windows
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 3
