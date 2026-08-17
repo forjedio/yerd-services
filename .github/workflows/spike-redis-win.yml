@@ -43,6 +43,25 @@ jobs:
       # Proves version-label honesty, the forward-slash path form the daemon must use, and
       # that MSYS2's fork() emulation actually completes a BGSAVE — all three are permanent
       # assertions in smoke-test.sh, so the spike needs no bespoke checks of its own.
+      # TEMPORARY diagnostic — the smoke test reported no server output at all, so find out
+      # what redis-server.exe actually does when run directly. Removed once green.
+      - name: Diagnose the built binary
+        run: |
+          set -x
+          d=$(mktemp -d); tar xf dist/redis-7.2.15-windows-x86_64.tar.gz -C "$d"
+          ls -la "$d/bin"
+          echo "--- --version (exit code captured) ---"
+          "$d/bin/redis-server.exe" --version; echo "rc=$?"
+          echo "--- ldd from MSYS2 ---"
+          /c/msys64/usr/bin/bash.exe -lc "ldd '$(cygpath -m "$d")/bin/redis-server.exe'" || true
+          echo "--- foreground start for 5s ---"
+          mkdir -p "$d/data"
+          "$d/bin/redis-server.exe" --port 21999 --dir "$(cygpath -m "$d/data")" \
+            --save '' --appendonly no > "$d/srv.log" 2>&1 &
+          sleep 5
+          echo "--- server log ---"; cat "$d/srv.log" || true
+          echo "--- ping ---"; "$d/bin/redis-cli.exe" -p 21999 ping; echo "rc=$?"
+
       - name: Smoke-test it
         run: scripts/smoke-test.sh redis dist/redis-7.2.15-windows-x86_64.tar.gz
 
