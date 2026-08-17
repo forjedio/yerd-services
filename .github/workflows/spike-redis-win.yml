@@ -54,13 +54,22 @@ jobs:
           "$d/bin/redis-server.exe" --version; echo "rc=$?"
           echo "--- ldd from MSYS2 ---"
           /c/msys64/usr/bin/bash.exe -lc "ldd '$(cygpath -m "$d")/bin/redis-server.exe'" || true
-          echo "--- foreground start for 5s ---"
+          set +x
+          W="$(cygpath -w "$d")"
+          echo "=== A: --version under Git Bash (current shell) ==="
+          "$d/bin/redis-server.exe" --version 2>&1 | head -3; echo "rc=${PIPESTATUS[0]}"
+          echo "=== B: --version under cmd.exe (native, no msys parent) ==="
+          cmd.exe /c "$W\\bin\\redis-server.exe --version" 2>&1 | head -3; echo "rc=$?"
+          echo "=== C: --version under MSYS2 bash (matching runtime) ==="
+          /c/msys64/usr/bin/bash.exe -lc "'$(cygpath -m "$d")/bin/redis-server.exe' --version" 2>&1 | head -3
+          echo "=== D: server started via cmd.exe, then ping ==="
           mkdir -p "$d/data"
-          "$d/bin/redis-server.exe" --port 21999 --dir "$(cygpath -m "$d/data")" \
-            --save '' --appendonly no > "$d/srv.log" 2>&1 &
-          sleep 5
-          echo "--- server log ---"; cat "$d/srv.log" || true
-          echo "--- ping ---"; "$d/bin/redis-cli.exe" -p 21999 ping; echo "rc=$?"
+          cmd.exe /c "start /b $W\\bin\\redis-server.exe --port 21999 --dir $(cygpath -m "$d/data") --save \"\" --appendonly no > $W\\srv.log 2>&1"
+          sleep 6
+          echo "--- srv.log ---"; cat "$d/srv.log" 2>/dev/null || echo "(empty/missing)"
+          echo "--- ping via cmd ---"; cmd.exe /c "$W\\bin\\redis-cli.exe -p 21999 ping" 2>&1 | head -3
+          echo "--- ping via git bash ---"; "$d/bin/redis-cli.exe" -p 21999 ping 2>&1 | head -3
+          true
 
       - name: Smoke-test it
         run: scripts/smoke-test.sh redis dist/redis-7.2.15-windows-x86_64.tar.gz
