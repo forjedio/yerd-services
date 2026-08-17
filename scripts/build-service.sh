@@ -334,6 +334,16 @@ if [[ "$OS" == windows ]]; then
       done
       [[ -n "$init_tool" ]] || { echo "mariadb(windows): no init tool (mariadb-install-db.exe/mysql_install_db.exe)" >&2; exit 1; }
       win_stage_bin "$root" "$stage" mariadbd.exe mariadb.exe mariadb-dump.exe "$init_tool"
+      # mariadb-install-db.exe derives basedir from its own path and execs `bin\mysqld.exe`
+      # by that literal name — it does NOT fall back to mariadbd.exe. The vendor zip ships
+      # mysqld.exe as a compatibility copy (no symlinks in a zip), so prefer it; duplicate
+      # mariadbd.exe under that name if a future zip drops it. Without this the artifact
+      # cannot initialise a datadir at all — on the runner OR on a user's machine.
+      if [[ -e "$root/bin/mysqld.exe" ]]; then
+        cp "$root/bin/mysqld.exe" "$stage/bin/mysqld.exe"
+      else
+        cp "$stage/bin/mariadbd.exe" "$stage/bin/mysqld.exe"
+      fi
       cp -R "$root/share" "$stage/share"
       [[ -d "$root/lib/plugin" ]] && { mkdir -p "$stage/lib"; cp -R "$root/lib/plugin" "$stage/lib/plugin"; }
       # Same bootstrap-input asserts as the Unix paths.
@@ -343,7 +353,7 @@ if [[ "$OS" == windows ]]; then
         || { echo "mariadb: system-table SQL missing from share/" >&2; exit 1; }
       windows_bundle_runtime "$stage"
       windows_self_contain_gate "$stage"
-      require_files "$stage" bin/mariadbd.exe bin/mariadb.exe bin/mariadb-dump.exe "bin/$init_tool"
+      require_files "$stage" bin/mariadbd.exe bin/mysqld.exe bin/mariadb.exe bin/mariadb-dump.exe "bin/$init_tool"
       ;;
 
     postgres)
