@@ -350,7 +350,15 @@ if [[ "$OS" == windows ]]; then
       # make IGNORES a deps failure and only reports it later as a missing .a at link time.
       # If this build fails with "cannot find ../deps/<x>/lib<x>.a", the real error is
       # earlier in the log, inside that dep's compile.
-      "$msys_bash" -lc "cd '$src_m' && make -j$jobs BUILD_TLS=no MALLOC=libc CFLAGS='-I$shim_m'" \
+      # OPTIMIZATION=-O2 is LOAD-BEARING, not a preference. src/Makefile:20-27 turns on LTO
+      # (`-flto=auto` + `-flto` at link) whenever OPTIMIZATION is exactly `-O3`, its default.
+      # Under gcc 15 targeting the emulation layer, that LTO build produces a binary which
+      # starts, exits 0 and does nothing at all — no output even from `--version`, and no
+      # server. -O2 misses the `ifeq` guard, so LTO never engages and the binary works, while
+      # keeping real optimisation (the reference project reaches for -O0, which is not
+      # necessary). If a future bump reverts to -O3, the smoke test's version assertion is
+      # what will catch it: an inert binary reports no version at all.
+      "$msys_bash" -lc "cd '$src_m' && make -j$jobs BUILD_TLS=no MALLOC=libc OPTIMIZATION=-O2 CFLAGS='-I$shim_m'" \
         || { echo "redis(windows): source build failed" >&2; exit 1; }
       cp "$work/redis/src/redis-server.exe" "$work/redis/src/redis-cli.exe" "$stage/bin/"
       # Stage the POSIX runtime the built exes need. Derive the set with ldd rather than

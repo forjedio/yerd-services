@@ -43,33 +43,13 @@ jobs:
       # Proves version-label honesty, the forward-slash path form the daemon must use, and
       # that MSYS2's fork() emulation actually completes a BGSAVE — all three are permanent
       # assertions in smoke-test.sh, so the spike needs no bespoke checks of its own.
-      # TEMPORARY diagnostic — the smoke test reported no server output at all, so find out
-      # what redis-server.exe actually does when run directly. Removed once green.
-      - name: Diagnose the built binary
+      # TEMPORARY — an LTO-broken binary is silent rather than failing, so print the version
+      # before the smoke test to make the failure mode obvious in the log. Removed once green.
+      - name: Show the built binary's version
         run: |
-          set -x
           d=$(mktemp -d); tar xf dist/redis-7.2.15-windows-x86_64.tar.gz -C "$d"
           ls -la "$d/bin"
-          echo "--- --version (exit code captured) ---"
-          "$d/bin/redis-server.exe" --version; echo "rc=$?"
-          echo "--- ldd from MSYS2 ---"
-          /c/msys64/usr/bin/bash.exe -lc "ldd '$(cygpath -m "$d")/bin/redis-server.exe'" || true
-          set +x
-          W="$(cygpath -w "$d")"
-          echo "=== A: --version under Git Bash (current shell) ==="
-          "$d/bin/redis-server.exe" --version 2>&1 | head -3; echo "rc=${PIPESTATUS[0]}"
-          echo "=== B: --version under cmd.exe (native, no msys parent) ==="
-          cmd.exe /c "$W\\bin\\redis-server.exe --version" 2>&1 | head -3; echo "rc=$?"
-          echo "=== C: --version under MSYS2 bash (matching runtime) ==="
-          /c/msys64/usr/bin/bash.exe -lc "'$(cygpath -m "$d")/bin/redis-server.exe' --version" 2>&1 | head -3
-          echo "=== D: server started via cmd.exe, then ping ==="
-          mkdir -p "$d/data"
-          cmd.exe /c "start /b $W\\bin\\redis-server.exe --port 21999 --dir $(cygpath -m "$d/data") --save \"\" --appendonly no > $W\\srv.log 2>&1"
-          sleep 6
-          echo "--- srv.log ---"; cat "$d/srv.log" 2>/dev/null || echo "(empty/missing)"
-          echo "--- ping via cmd ---"; cmd.exe /c "$W\\bin\\redis-cli.exe -p 21999 ping" 2>&1 | head -3
-          echo "--- ping via git bash ---"; "$d/bin/redis-cli.exe" -p 21999 ping 2>&1 | head -3
-          true
+          "$d/bin/redis-server.exe" --version
 
       - name: Smoke-test it
         run: scripts/smoke-test.sh redis dist/redis-7.2.15-windows-x86_64.tar.gz
