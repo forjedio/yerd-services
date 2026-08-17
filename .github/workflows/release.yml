@@ -266,3 +266,243 @@ jobs:
             | { grep '\.tar\.gz$' || true; } | LC_ALL=C sort > names.txt
           scripts/gen-manifest.sh < names.txt > services.json
           gh release upload "$RELEASE_TAG" services.json --clobber
+
+  # Mirror the just-published (or just-removed) state to BunnyCDN. ADDITIVE for build,
+  # scoped-destructive for remove; wholesale pruning is the manual cdn-sync.yml's job.
+  # NON-FATAL: GitHub Releases stays the source of truth (README's "URLs the consumer
+  # hard-codes"), so a CDN hiccup must never fail a release — cdn-sync.yml heals any
+  # partial mirror.
+  #
+  # CDN layout (see README's "CDN mirror"):
+  #   services/<service>-<version>-<os>-<arch>.tar.gz   flat, no history
+  #   services/services.json                            contract copy: SERVICES_BASE_URL
+  #                                                     = https://<pullzone>/services works
+  #                                                     unchanged for BOTH the listing and
+  #                                                     the artifacts
+  #   services.json                                     zone-root copy, for browsing/tooling
+  cdn-mirror:
+    needs: finalize
+    # `needs:` already gates on finalize succeeding; spelling it out makes the four cases
+    # legible: build/all-pass -> runs; build/one-leg-fails -> finalize skipped -> skipped;
+    # remove -> finalize's always() passes -> runs; cancelled -> skipped.
+    if: ${{ !cancelled() && needs.finalize.result == 'success' }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    # Narrower than the workflow's contents:write — this job only reads the release.
+    permissions:
+      contents: read
+    # No job-level concurrency group needed: the whole run already holds the constant
+    # top-level `services-release` group, which cdn-sync.yml shares, so a manual sync and
+    # an automatic mirror can never interleave writes to the root manifest.
+    env:
+      BUNNY_STORAGE_ACCESS_KEY: ${{ secrets.BUNNY_STORAGE_ACCESS_KEY }}
+      BUNNY_PURGE_API_KEY: ${{ secrets.BUNNY_PURGE_API_KEY }}
+      BUNNY_STORAGE_ZONE: ${{ vars.BUNNY_STORAGE_ZONE }}
+      BUNNY_STORAGE_ENDPOINT: ${{ vars.BUNNY_STORAGE_ENDPOINT }}
+      PULLZONE: ${{ vars.BUNNY_PULLZONE_HOST }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The paginated assets endpoint is MANDATORY, not future-proofing: the REST
+      # default is per_page=30 and this release already holds more assets than that,
+      # so an un-paginated read silently truncates. gh merges the pages into one array.
+      - name: Snapshot the live asset set
+        id: snapshot
+        run: |
+          set -euo pipefail
+          : "${PULLZONE:?BUNNY_PULLZONE_HOST is not set}"
+          id="$(gh api "repos/${GH_REPO}/releases/tags/${RELEASE_TAG}" -q .id)"
+          gh api --paginate "repos/${GH_REPO}/releases/${id}/assets" > assets.json
+          jq -r '.[] | select(.state=="uploaded") | .name' assets.json \
+            | { grep '\.tar\.gz$' || true; } | LC_ALL=C sort > names.txt
+          echo "live uploaded tarballs: $(wc -l < names.txt)"
+
+      # Enumerate this dispatch's (service, version) artifact names exactly as finalize's
+      # remove sweep does (same lib.sh helpers), so the postgres base+`-full` pair and the
+      # valkey->redis alias are handled by the code that defines them.
+      #   touched_build - filtered by inputs.targets, so a single-platform rebuild moves and
+      #                   purges only that platform (up to 8 objects / ~800MB for postgres).
+      #   touched_all   - the full os x arch cross-product. The remove branch MUST use this:
+      #                   finalize's sweep is target-agnostic, so filtering here would leave
+      #                   CDN objects serving artifacts that no longer exist on the release.
+      - name: Enumerate touched artifact names
+        run: |
+          set -euo pipefail
+          source scripts/lib.sh
+          svc="$(canonical_service "${{ inputs.service }}")"
+          ver="${{ inputs.version }}"
+          vers=("$ver")
+          [[ "$svc" == postgres ]] && vers+=("${ver}-full")
+          : > touched_all.txt
+          : > touched_build.txt
+          want="${{ inputs.targets }}"
+          for v in "${vers[@]}"; do
+            for os in linux macos windows; do
+              for arch in x86_64 aarch64; do
+                name="$(artifact_filename "$svc" "$v" "$os" "$arch")"
+                echo "$name" >> touched_all.txt
+                if [[ "$want" == "all" || "$want" == "${os}-${arch}" ]]; then
+                  echo "$name" >> touched_build.txt
+                fi
+              done
+            done
+          done
+          LC_ALL=C sort -o touched_all.txt touched_all.txt
+          LC_ALL=C sort -o touched_build.txt touched_build.txt
+
+      # BUILD: upload artifacts -> publish manifest -> purge (artifacts first, then the
+      # manifest URLs). Artifacts before the manifest so the manifest never names an object
+      # that is not there yet; artifacts purged before it too, so a URL negatively cached by
+      # a pre-upload probe cannot 404 while the manifest advertises it.
+      - name: Mirror artifacts + manifest (action == build)
+        id: build_mirror
+        if: ${{ inputs.action == 'build' }}
+        run: |
+          set -euo pipefail
+          source scripts/lib.sh
+          put="scripts/bunny-put.sh"
+          LC_ALL=C comm -12 touched_build.txt names.txt > upload.txt
+          [[ -s upload.txt ]] || { echo "no touched artifact is live on the release" >&2; exit 1; }
+          : > purge_urls.txt
+          while IFS= read -r name; do
+            [[ -n "$name" ]] || continue
+            gh release download "$RELEASE_TAG" --pattern "$name" --dir mirror --clobber
+            dig="$(jq -r --arg n "$name" \
+              '.[] | select(.name==$n) | (.digest // "") | sub("^sha256:";"")' assets.json)"
+            # noheader: no header to send, so verify the bytes locally instead — that cell
+            # would otherwise have no content verification at all (the post-PUT check is a
+            # ranged existence GET).
+            if [[ "$CDN_CHECKSUM_MODE" == noheader ]]; then
+              if [[ -n "$dig" ]]; then
+                echo "${dig}  mirror/${name}" | sha256sum -c - >/dev/null \
+                  || { echo "::error::local digest mismatch for $name" >&2; exit 1; }
+              fi
+              bash "$put" "mirror/$name" "services/$name"
+            else
+              bash "$put" "mirror/$name" "services/$name" "$dig"
+            fi
+            echo "https://${PULLZONE}/services/${name}" >> purge_urls.txt
+          done < upload.txt
+          # The manifest finalize just published, in this same serialized run.
+          gh release download "$RELEASE_TAG" --pattern services.json --dir mf --clobber
+          mdig="$(jq -r '.[] | select(.name=="services.json") | (.digest // "") | sub("^sha256:";"")' assets.json)"
+          if [[ "$CDN_CHECKSUM_MODE" == noheader ]]; then
+            bash "$put" mf/services.json services/services.json
+            bash "$put" mf/services.json services.json
+          else
+            bash "$put" mf/services.json services/services.json "$mdig"
+            bash "$put" mf/services.json services.json "$mdig"
+          fi
+          {
+            echo "https://${PULLZONE}/services/services.json"
+            echo "https://${PULLZONE}/services.json"
+          } >> purge_urls.txt
+          xargs -a purge_urls.txt bash scripts/bunny-purge.sh
+
+      # REMOVE: publish the shrunken manifest -> PURGE IT -> delete objects -> purge those.
+      # The purge before the deletes is load-bearing: a PUT alone does not stop the edge
+      # serving the old listing, so deleting first would leave a window where the edge
+      # advertises a version whose artifacts already 404.
+      - name: Unmirror a version (action == remove)
+        id: remove_mirror
+        if: ${{ inputs.action == 'remove' }}
+        run: |
+          set -euo pipefail
+          source scripts/lib.sh
+          put="scripts/bunny-put.sh"
+          # finalize deletes the assets and THEN regenerates services.json as its last step,
+          # so this download is already the post-remove listing.
+          gh release download "$RELEASE_TAG" --pattern services.json --dir mf --clobber
+          mdig="$(jq -r '.[] | select(.name=="services.json") | (.digest // "") | sub("^sha256:";"")' assets.json)"
+          if [[ "$CDN_CHECKSUM_MODE" == noheader ]]; then
+            bash "$put" mf/services.json services/services.json
+            bash "$put" mf/services.json services.json
+          else
+            bash "$put" mf/services.json services/services.json "$mdig"
+            bash "$put" mf/services.json services.json "$mdig"
+          fi
+          bash scripts/bunny-purge.sh \
+            "https://${PULLZONE}/services/services.json" \
+            "https://${PULLZONE}/services.json"
+          # Intersect with the real listing so bunny-delete.sh is never handed a path that
+          # does not exist (no 404-tolerance hack needed for never-mirrored platforms).
+          bash scripts/bunny-list.sh services/ > listing.json
+          jq -r '.[] | .path | sub("^services/";"")' listing.json | LC_ALL=C sort > present.txt
+          LC_ALL=C comm -12 touched_all.txt present.txt > delete.txt
+          : > deleted_urls.txt
+          while IFS= read -r name; do
+            [[ -n "$name" ]] || continue
+            bash scripts/bunny-delete.sh "services/$name"
+            echo "https://${PULLZONE}/services/${name}" >> deleted_urls.txt
+          done < delete.txt
+          if [[ -s deleted_urls.txt ]]; then
+            xargs -a deleted_urls.txt bash scripts/bunny-purge.sh
+          else
+            echo "nothing to delete on the CDN for this version"
+          fi
+
+      # Outcome summary FIRST, unconditional and network-free (mirrors yerd's Summarize),
+      # so a run with the Bunny secrets unset still explains itself. The coverage check runs
+      # afterwards as a separate best-effort step.
+      - name: Summarize
+        if: always()
+        env:
+          SNAPSHOT: ${{ steps.snapshot.outcome }}
+          BUILD_MIRROR: ${{ steps.build_mirror.outcome }}
+          REMOVE_MIRROR: ${{ steps.remove_mirror.outcome }}
+        run: |
+          {
+            if [ "$BUILD_MIRROR" = "success" ] || [ "$REMOVE_MIRROR" = "success" ]; then
+              echo "### CDN mirror updated"
+              echo ""
+              echo "- action: \`${{ inputs.action }}\` / service: \`${{ inputs.service }}\` / version: \`${{ inputs.version }}\`"
+              echo "- layout: \`services/\` + \`services/services.json\` + root \`services.json\`"
+              echo "- consumer base: \`https://${PULLZONE}/services\`"
+            else
+              echo "### CDN mirror did not complete"
+              echo ""
+              echo "- snapshot: ${SNAPSHOT} / build-mirror: ${BUILD_MIRROR} / remove-mirror: ${REMOVE_MIRROR}"
+              echo "- GitHub Releases remains the source of truth; run \`cdn-sync.yml\` to reconcile."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Best-effort coverage check. Basis differs per action: on build, the assets that
+      # actually exist on the release (touched_all n names.txt — NOT touched_build, or a
+      # single-target rebuild would never notice a missing sibling platform); on remove, the
+      # inverse assertion that nothing survives. Never fails the step.
+      - name: Coverage check
+        if: ${{ always() && steps.snapshot.outcome == 'success' }}
+        run: |
+          set -uo pipefail
+          # `Enumerate touched artifact names` has no id, so nothing gates this step on it;
+          # without the -s test a missing touched_all.txt would make comm produce an empty
+          # diff and this step would print "Coverage: OK." right under a failure summary.
+          [ -s touched_all.txt ] || {
+            echo "_(coverage check unavailable: no touched-name list)_" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          bash scripts/bunny-list.sh services/ > post.json 2>/dev/null || {
+            echo "_(coverage check unavailable)_" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          jq -r '.[] | .path | sub("^services/";"")' post.json | LC_ALL=C sort > post.txt
+          if [ "${{ inputs.action }}" = "build" ]; then
+            # Basis is the UNFILTERED asset names, not names.txt. names.txt is state-filtered,
+            # and so is the upload loop, so deriving the expectation from it too would let the
+            # two filters hide each other: an asset momentarily not `uploaded` is skipped by the
+            # mirror AND invisible here, while finalize's unfiltered manifest still advertises it.
+            jq -r '.[].name' assets.json | { grep '\.tar\.gz$' || true; } | LC_ALL=C sort > all_names.txt
+            LC_ALL=C comm -12 touched_all.txt all_names.txt > expect.txt
+            missing="$(LC_ALL=C comm -23 expect.txt post.txt)"
+            label="expected on the CDN but absent"
+          else
+            missing="$(LC_ALL=C comm -12 touched_all.txt post.txt)"
+            label="should have been deleted but remain"
+          fi
+          if [ -n "$missing" ]; then
+            { echo ""; echo "<details><summary>Coverage: objects ${label}</summary>"; echo ""
+              printf '%s\n' "$missing" | sed 's/^/- `/;s/$/`/'
+              echo ""; echo "</details>"
+              echo ""; echo "_Run \`cdn-sync.yml\` to reconcile._"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            { echo ""; echo "Coverage: OK."; } >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -8,6 +8,34 @@
 
 set -euo pipefail
 
+# --- CDN mirror configuration -----------------------------------------------------
+
+# CDN_CHECKSUM_MODE: the resolved Bunny-checksum behaviour of the storage zone, and
+# the SINGLE source of truth for it. Both writers read this constant — release.yml's
+# `cdn-mirror` job and cdn-sync.yml — and cdn-sync passes it verbatim to
+# cdn-reconcile-plan.sh as --checksum-mode, which echoes it into the plan so the run
+# summary can never claim a comparison mode different from the one that ran.
+#
+# It encodes the answers to three questions about the zone (see the "CDN mirror"
+# section of README.md for the full matrix and how to resolve them):
+#   hash       accepts a `Checksum:` header, populates it on PUT, AND refreshes it on
+#              in-place overwrite  -> full hash comparison
+#   nopopulate accepts the header but never populates the listing `Checksum`
+#              -> size-only comparison (digest still sent: free server-side rejection)
+#   stale      accepts and populates, but does NOT refresh on overwrite
+#              -> size-only, and the reconcile nulls the CDN checksums first. Without
+#                 that, a stale (non-null!) checksum mismatches forever and every sync
+#                 re-uploads the whole mirror.
+#   noheader   does not accept the header at all -> size-only, no digest sent, and the
+#              callers verify each download locally with sha256sum instead
+#
+# DEFAULT `noheader`: the fail-safe cell. It never churns and never depends on
+# unverified Bunny behaviour, and content integrity still comes from the local
+# sha256sum verify. Change it only after empirically confirming the zone's behaviour;
+# setting `hash` on a zone that does not refresh on overwrite causes permanent
+# re-upload churn that the run summary would report as healthy.
+CDN_CHECKSUM_MODE="${CDN_CHECKSUM_MODE:-noheader}"
+
 # --- platform tokens ------------------------------------------------------------
 
 # host_os: map `uname -s` to the contract os token. Fails loudly on anything else.

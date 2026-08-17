@@ -151,6 +151,95 @@ within GitHub's acceptable-use posture: artifacts are downloaded once per instal
 on the user's disk, so traffic scales with installs, not usage. If volume ever warranted it,
 the escape hatch is to move `SERVICES_BASE_URL` to a CDN while keeping this artifact contract.
 
+## CDN mirror
+
+The escape hatch above is implemented: every artifact is mirrored to a **BunnyCDN storage
+zone**, and the consumer can be pointed at it by changing `SERVICES_BASE_URL` alone. GitHub
+Releases remains the source of truth — the CDN is a mirror, never the primary.
+
+**Zone layout** (flat, no history — only the current file for each `(service, version, platform)`):
+
+```
+services/<service>-<version>-<os>-<arch>.tar.gz   the artifacts
+services/services.json                            listing, contract copy
+services.json                                     listing, zone-root copy
+```
+
+The listing is **written to both locations**, byte-identical, in the same step. That is what
+keeps the artifact contract intact: with `SERVICES_BASE_URL = https://<pullzone>/services`,
+both `{base}/services.json` and `{base}/<filename>` resolve, so **no consumer change beyond
+the base URL**. The zone-root copy is for browsing and tooling. There is no signature file —
+`services.json` is unsigned here exactly as it is on the GitHub release.
+
+**Two workflows:**
+
+| workflow | trigger | what it does |
+|---|---|---|
+| `release.yml` job `cdn-mirror` | automatic, after `finalize` | Mirrors just the dispatched `(service, version)`. On `build`: uploads the platforms, publishes both manifest copies, purges. On `remove`: publishes + purges the shrunken manifest **first**, then deletes the objects. `continue-on-error` — a CDN hiccup never fails a release. |
+| `cdn-sync.yml` | manual `workflow_dispatch` | Reconciles the whole zone against the live release: uploads missing, re-uploads changed, deletes orphans. **Defaults to a dry run** — prints the plan and mutates nothing until re-run with `apply=true`. Run this whenever the CDN and the release have drifted. |
+
+Both hold the same `services-release` concurrency group, so a manual sync and an automatic
+mirror can never interleave writes to the manifest.
+
+**Change detection** uses the per-asset SHA-256 that GitHub already publishes (`digest` on the
+release asset) compared against Bunny's listing `Checksum`, with object size as the fallback.
+No `SHA256SUMS` file is involved. `scripts/cdn-reconcile-plan.sh` computes the plan offline
+from two JSON snapshots and is unit-tested in `scripts/test.sh`.
+
+Two safety properties are worth knowing because they are easy to break:
+
+- An asset that exists on the release but is **not yet in state `uploaded`** (a half-finished
+  publish) is excluded from the manifest but its CDN object is **preserved**, never treated as
+  an orphan. The sync warns instead.
+- `services/services.json` is in the reconcile's protected set, so the contract copy is never
+  pruned. `bunny-delete.sh` independently refuses any path outside `services/`.
+
+### `CDN_CHECKSUM_MODE` — set this before the first sync
+
+Bunny's checksum behaviour varies by zone, and getting it wrong causes either silent
+non-verification or permanent re-upload churn. The resolved answer lives in **one** place, the
+`CDN_CHECKSUM_MODE` constant in `scripts/lib.sh`, read by both writers and echoed into every
+sync plan so a run summary can never claim a mode different from the one that ran.
+
+Determine the zone's behaviour once (does a PUT accept a `Checksum:` header? does the listing
+`Checksum` get populated? is it **refreshed on in-place overwrite**?) and set the matching value:
+
+| mode | zone behaviour | digest sent on PUT | comparison |
+|---|---|---|---|
+| `hash` | accepts, populates, **refreshes** | yes | full hash comparison |
+| `nopopulate` | accepts but never populates | yes | size-only |
+| `stale` | accepts and populates, **never refreshes** | yes | size-only; CDN checksums nulled first |
+| `noheader` | does not accept the header | no | size-only; downloads verified locally instead |
+
+**The default is `noheader`** — the fail-safe cell: it never churns, never relies on unverified
+behaviour, and still verifies content via a local `sha256sum` before upload. Setting `hash` on a
+zone that does not refresh on overwrite makes every sync re-upload the whole mirror forever,
+which the summary would report as healthy. `stale` exists precisely because a stale checksum is
+non-null, so it mismatches forever unless the reconcile ignores CDN checksums outright.
+
+The `verify_checksums` input on `cdn-sync.yml` is a deliberate **full-mirror repair**, not
+routine maintenance. Outside mode `hash`, size-only comparison is the expected steady state and
+the plan reports it without a call to action.
+
+### Prerequisites (one-time, per repo)
+
+GitHub secrets and variables are per-repository, so these must be configured on
+`forjedio/yerd-services` even if the sibling `forjedio/yerd` repo already has them.
+
+- Secrets: `BUNNY_STORAGE_ACCESS_KEY` (storage-zone password), `BUNNY_PURGE_API_KEY`
+  (account-scoped purge key — scope and rotate it as narrowly as Bunny allows).
+- Variables: `BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_ENDPOINT` (the **region host**, e.g.
+  `ny.storage.bunnycdn.com` — a wrong region 401s indistinguishably from a bad key),
+  `BUNNY_PULLZONE_HOST`.
+- Set `CDN_CHECKSUM_MODE` in `scripts/lib.sh` per the table above.
+
+Then, **before pointing any consumer at the CDN**: run `cdn-sync.yml` with `apply=false`,
+review the printed plan, then re-run with `apply=true` to backfill every existing artifact. The
+mirror is incomplete until that has succeeded — `services.json` lists all live versions, so
+CDN-derived URLs for pre-existing versions 404 until the backfill runs. Confirm in the Actions
+tab that each run actually **executed** (GitHub keeps only one pending run per concurrency
+group, so a queued run can be superseded by a later dispatch).
+
 ## Provenance
 
 | service | version | upstream source | how | notes |
@@ -375,9 +464,15 @@ yerd-services/
 │   ├── build-service.sh            # build/repackage ONE (service,version,upstream) for the host platform
 │   ├── smoke-test.sh               # extract a built artifact + run the server (SELECT 1 / PING / GET /health) — each build leg, pre-publish
 │   ├── gen-manifest.sh             # *.tar.gz names (stdin) → services.json (the daemon's listing)
-│   └── test.sh                     # dependency-free unit tests (naming, archive layout, manifest merge, meilisearch smoke harness)
+│   ├── bunny-put.sh                # PUT one file to the Bunny storage zone + verify it landed
+│   ├── bunny-list.sh               # recursively list a zone prefix → [{path,size,checksum}]
+│   ├── bunny-delete.sh             # DELETE one object; refuses any path outside services/
+│   ├── bunny-purge.sh              # purge pull-zone URLs from the edge cache (rides 429 throttling)
+│   ├── cdn-reconcile-plan.sh       # two JSON snapshots → upload/update/delete plan (no network)
+│   └── test.sh                     # dependency-free unit tests (naming, archive layout, manifest merge, meilisearch smoke harness, CDN reconcile + delete guard)
 └── .github/workflows/
-    └── release.yml                 # workflow_dispatch: ensure-release → build (build+smoke) → finalize
+    ├── release.yml                 # workflow_dispatch: ensure-release → build (build+smoke) → finalize → cdn-mirror
+    └── cdn-sync.yml                # workflow_dispatch: reconcile the CDN against the live release (dry run by default)
 ```
 
 ## Platform matrix

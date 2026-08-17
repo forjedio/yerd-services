@@ -166,6 +166,136 @@ EOF
   fi
 fi
 
+echo "== 8. CDN reconcile plan classification =="
+# cdn-reconcile-plan.sh is pure bash+jq with NO network, so the whole classifier is
+# testable here from two JSON fixtures. These cases pin the defects that are easy to
+# reintroduce: protecting a not-yet-uploaded asset's object, protecting the services/
+# contract copy, and never letting an unusable CDN checksum cause perpetual re-upload.
+plan="$here/cdn-reconcile-plan.sh"
+cdn="$work/cdn"; mkdir -p "$cdn"
+
+cat >"$cdn/assets.json" <<'EOF'
+[
+ {"name":"redis-8-linux-x86_64.tar.gz","size":100,"state":"uploaded","digest":"sha256:aaaa"},
+ {"name":"redis-8-macos-aarch64.tar.gz","size":200,"state":"uploaded","digest":"sha256:bbbb"},
+ {"name":"postgres-17-linux-x86_64.tar.gz","size":300,"state":"uploaded","digest":"sha256:cccc"},
+ {"name":"postgres-17-full-linux-x86_64.tar.gz","size":400,"state":"uploaded","digest":"sha256:dddd"},
+ {"name":"mysql-8-linux-x86_64.tar.gz","size":500,"state":"open","digest":null},
+ {"name":"services.json","size":50,"state":"uploaded","digest":"sha256:eeee"}
+]
+EOF
+cat >"$cdn/listing.json" <<'EOF'
+[
+ {"path":"services/redis-8-linux-x86_64.tar.gz","size":100,"checksum":"AAAA"},
+ {"path":"services/redis-8-macos-aarch64.tar.gz","size":200,"checksum":"FFFF"},
+ {"path":"services/postgres-17-linux-x86_64.tar.gz","size":999,"checksum":null},
+ {"path":"services/mysql-8-linux-x86_64.tar.gz","size":500,"checksum":null},
+ {"path":"services/services.json","size":50,"checksum":null},
+ {"path":"services/junk-orphan.tar.gz","size":7,"checksum":null},
+ {"path":"services/nested/deep.tar.gz","size":8,"checksum":null}
+]
+EOF
+# rp <mode> [extra args...] -> plan JSON on stdout
+rp() { local m="$1"; shift; "$plan" --assets-json "$cdn/assets.json" --cdn-listing "$cdn/listing.json" --checksum-mode "$m" "$@"; }
+q()  { jq -c "$1"; }
+
+h="$(rp hash)"
+eq "hash: absent object -> to_upload"          '["postgres-17-full-linux-x86_64.tar.gz"]' "$(printf '%s' "$h" | q '.to_upload')"
+eq "hash: digest!=checksum -> to_update"       'true' "$(printf '%s' "$h" | q '.to_update | index("redis-8-macos-aarch64.tar.gz") != null')"
+eq "hash: case-folded match -> in sync"        'true' "$(printf '%s' "$h" | q '.to_update | index("redis-8-linux-x86_64.tar.gz") == null')"
+eq "hash: null checksum + size differs -> to_update" 'true' "$(printf '%s' "$h" | q '.to_update | index("postgres-17-linux-x86_64.tar.gz") != null')"
+eq "orphan + nested orphan -> to_delete"       '["services/junk-orphan.tar.gz","services/nested/deep.tar.gz"]' "$(printf '%s' "$h" | q '.to_delete')"
+# The two protections. A `state: open` asset is excluded from the desired set, but its
+# CDN object must NOT be treated as an orphan, or a sync run during a half-finished
+# publish would delete a healthy artifact. And the services/ contract copy underpins
+# SERVICES_BASE_URL, so pruning it would break every consumer.
+eq "not-yet-uploaded asset's object PRESERVED" 'true' "$(printf '%s' "$h" | q '[.to_delete[] | select(test("mysql"))] | length == 0')"
+eq "not-yet-uploaded asset warned"             '["mysql-8-linux-x86_64.tar.gz"]' "$(printf '%s' "$h" | q '.not_uploaded')"
+eq "services/services.json PRESERVED"          'true' "$(printf '%s' "$h" | q '[.to_delete[] | select(test("services.json"))] | length == 0')"
+eq "hash: three buckets partition D"           'true' "$(printf '%s' "$h" | q '.counts.hash_compared + .counts.size_compared + (.to_upload|length) == .counts.desired')"
+eq "hash: null digest vs checksum -> unverified, not size_only" 'true' "$(printf '%s' "$h" | q '.size_only | length == 0')"
+
+# Every mode except `hash` must route the un-hash-comparable objects to size_only[] with
+# unverified[] EMPTY. unverified[] carries a "re-run with verify_checksums" cue, and on a
+# zone that can never populate a usable checksum that cue can never converge — it would
+# move the whole mirror on every run, forever.
+for m in nopopulate stale noheader; do
+  o="$(rp "$m")"
+  eq "$m: unverified is empty"                 '0'    "$(printf '%s' "$o" | q '.unverified | length')"
+  eq "$m: un-comparable -> size_only"          'true' "$(printf '%s' "$o" | q '.size_only | length > 0')"
+  eq "$m: no hash comparison happened"         '0'    "$(printf '%s' "$o" | q '.counts.hash_compared')"
+  eq "$m: buckets still partition D"           'true' "$(printf '%s' "$o" | q '.counts.hash_compared + .counts.size_compared + (.to_upload|length) == .counts.desired')"
+  eq "$m: echoes checksum_mode"                "\"$m\"" "$(printf '%s' "$o" | q '.checksum_mode')"
+done
+# The anti-churn property, stated directly: under `stale` the CDN checksum is non-null but
+# untrustworthy, so a mismatch must NOT schedule a re-upload.
+eq "stale: mismatching checksum does NOT churn" 'true' \
+  "$(rp stale | q '.to_update | index("redis-8-macos-aarch64.tar.gz") == null')"
+eq "verify_checksums off by default"            'false' "$(rp stale | q '.verify_checksums')"
+# Opt-in repair: forces the size_only set into to_update and reports itself as on.
+v="$(rp stale --verify-checksums)"
+eq "verify: size_only becomes empty"            '0'    "$(printf '%s' "$v" | q '.size_only | length')"
+eq "verify: forces re-upload"                   'true' "$(printf '%s' "$v" | q '.to_update | index("redis-8-macos-aarch64.tar.gz") != null')"
+eq "verify: echoed into the plan"               'true' "$(printf '%s' "$v" | q '.verify_checksums')"
+
+# Guards. An empty desired set means a partial GitHub read; proceeding would classify
+# every live object as an orphan, so it must hard-fail rather than plan a wipe.
+printf '[]\n' > "$cdn/empty.json"
+if "$plan" --assets-json "$cdn/empty.json" --cdn-listing "$cdn/listing.json" --checksum-mode hash >/dev/null 2>&1; then
+  bad "empty desired set hard-fails" "unexpectedly exited 0"
+else ok "empty desired set hard-fails"; fi
+if rp bogus >/dev/null 2>&1; then bad "invalid --checksum-mode rejected" "exited 0"; else ok "invalid --checksum-mode rejected"; fi
+if "$plan" --assets-json "$cdn/assets.json" --cdn-listing "$cdn/listing.json" >/dev/null 2>&1; then
+  bad "missing --checksum-mode rejected" "exited 0"
+else ok "missing --checksum-mode rejected"; fi
+# Determinism: arrays are LC_ALL=C-sorted, so two runs are byte-identical.
+eq "plan output is deterministic" "$(rp hash)" "$(rp hash)"
+
+echo "== 9. bunny-delete.sh path guard =="
+# The guard is the last line of defence for the destructive path, so test it directly.
+# Dummy creds satisfy the `:?` asserts; every rejection below returns before any network
+# call, so nothing here can touch a real zone.
+del="$here/bunny-delete.sh"
+dguard() {
+  BUNNY_STORAGE_ACCESS_KEY=x BUNNY_STORAGE_ZONE=z BUNNY_STORAGE_ENDPOINT=e \
+    "$del" "$1" >/dev/null 2>&1
+}
+for bad_path in \
+  "/services/x.tar.gz" \
+  "services/../services.json" \
+  "services/" \
+  "services.json" \
+  "releases/foo.tar.gz" \
+  "services//x.tar.gz"
+do
+  if dguard "$bad_path"; then bad "guard rejects '$bad_path'" "exited 0"; else ok "guard rejects '$bad_path'"; fi
+done
+# Accepted paths must get PAST the guard and fail only at the network boundary. The
+# scripts hardcode https:// so a local mock can't serve them; reaching curl is the
+# strongest offline signal, so assert the failure is NOT the guard's message.
+for good_path in "services/redis-8-linux-x86_64.tar.gz" "services/nested/deep.tar.gz"; do
+  out="$(BUNNY_STORAGE_ACCESS_KEY=x BUNNY_STORAGE_ZONE=z BUNNY_STORAGE_ENDPOINT=e \
+    "$del" "$good_path" 2>&1 || true)"
+  absent "guard accepts '$good_path' (reaches network)" "$out" "refusing"
+done
+
+echo "== 10. manifest derivation parity with finalize =="
+# The sync regenerates services.json itself while cdn-mirror reuses finalize's asset.
+# They must agree whenever every asset is `uploaded` (the steady state) — and must
+# DIVERGE in the intended direction when one is mid-upload, since only the sync filters
+# on state (finalize's `gh release view` does not).
+mk_names_all() { jq -r '.[] | select(.state=="uploaded") | .name' "$1" | { grep '\.tar\.gz$' || true; } | LC_ALL=C sort; }
+mk_names_finalize() { jq -r '.[].name' "$1" | { grep '\.tar\.gz$' || true; } | LC_ALL=C sort; }
+jq '[.[] | select(.state=="open") | .name] | length' "$cdn/assets.json" >/dev/null
+jq 'map(if .state=="open" then .state="uploaded" else . end)' "$cdn/assets.json" > "$cdn/all-uploaded.json"
+eq "parity when every asset is uploaded" \
+  "$(mk_names_finalize "$cdn/all-uploaded.json" | "$gen")" \
+  "$(mk_names_all "$cdn/all-uploaded.json" | "$gen")"
+sync_mf="$(mk_names_all "$cdn/assets.json" | "$gen")"
+fin_mf="$(mk_names_finalize "$cdn/assets.json" | "$gen")"
+absent "sync omits a state:open asset"   "$sync_mf" "mysql"
+contains "finalize includes it (intended divergence)" "$fin_mf" "mysql"
+
 echo
 echo "==== $pass passed, $fail failed ===="
 [[ "$fail" -eq 0 ]]

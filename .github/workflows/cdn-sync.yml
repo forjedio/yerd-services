@@ -1,0 +1,308 @@
+name: CDN sync
+
+# Manually drive the BunnyCDN `services/` area into exact sync with the rolling
+# `services` GitHub release: upload missing objects, re-upload changed ones, and
+# (optionally) delete objects that no longer correspond to any live release asset.
+# Running once with apply=true also performs the initial BACKFILL (uploads every
+# artifact already on the release) — the CDN is incomplete until that has run, so no
+# consumer may be pointed at the CDN base before it succeeds.
+#
+# DELETE is destructive, so this defaults to a DRY RUN: it prints the full plan and
+# mutates nothing until you re-run with apply=true.
+#
+# Adapted from the sibling forjedio/yerd repo's cdn-sync.yml. Differences: no signing
+# (services.json is unsigned); a single rolling release instead of one per tag, so
+# there is no tag iteration and no draft-tag TOCTOU window; change detection uses the
+# per-asset GitHub `digest` rather than SHA256SUMS files; and the plan is computed by
+# scripts/cdn-reconcile-plan.sh (bash+jq) rather than a Rust xtask.
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Actually upload/update/delete (unchecked = dry run: print the plan only)."
+        type: boolean
+        default: false
+      include_deletes:
+        description: "Include deletions of orphaned CDN objects (uncheck for an additive-only sync)."
+        type: boolean
+        default: true
+      max_deletes:
+        description: "Refuse to apply if the plan would delete more than this many objects (guards a partial GitHub read)."
+        type: string
+        default: "10"
+      verify_checksums:
+        description: >-
+          Force-re-upload every object that could not be hash-compared. This is a deliberate
+          FULL-MIRROR REPAIR (~GiB, blocks releases for its duration), not routine
+          maintenance — on any zone whose CDN_CHECKSUM_MODE is not `hash`, size-only
+          comparison is the expected steady state and needs no action.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Share the constant `services-release` group with release.yml. That workflow's
+# top-level group is a single constant, so holding the same group here serializes this
+# sync against entire release runs (including their cdn-mirror job): the two can never
+# interleave writes to the root manifest, and the asset set cannot change between this
+# run's plan and its apply. Caveat: GitHub keeps only ONE pending run per group, so a
+# queued run can be superseded by a later dispatch — always confirm in the Actions tab
+# that the run actually executed, not merely that it was dispatched.
+concurrency:
+  group: services-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: services
+      BUNNY_STORAGE_ACCESS_KEY: ${{ secrets.BUNNY_STORAGE_ACCESS_KEY }}
+      BUNNY_PURGE_API_KEY: ${{ secrets.BUNNY_PURGE_API_KEY }}
+      BUNNY_STORAGE_ZONE: ${{ vars.BUNNY_STORAGE_ZONE }}
+      BUNNY_STORAGE_ENDPOINT: ${{ vars.BUNNY_STORAGE_ENDPOINT }}
+      PULLZONE: ${{ vars.BUNNY_PULLZONE_HOST }}
+      # Every input gets an uppercase env var (the convention yerd's cdn-sync.yml uses).
+      # A workflow_dispatch boolean arrives as the STRING "true"/"false", which is why the
+      # shell compares against the literal below rather than testing for non-emptiness.
+      APPLY: ${{ inputs.apply }}
+      INCLUDE_DELETES: ${{ inputs.include_deletes }}
+      MAX_DELETES: ${{ inputs.max_deletes }}
+      VERIFY: ${{ inputs.verify_checksums }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Fetch the source of truth. --paginate is MANDATORY, not future-proofing: the REST
+      # assets endpoint defaults to per_page=30 and this release already exceeds that, so an
+      # un-paginated read silently truncates (and a truncated read would classify live
+      # objects as orphans). Require >=1 uploaded tarball before anything can be planned.
+      - name: Fetch release assets
+        run: |
+          set -euo pipefail
+          : "${PULLZONE:?BUNNY_PULLZONE_HOST is not set}"
+          id="$(gh api "repos/${GH_REPO}/releases/tags/${RELEASE_TAG}" -q .id)"
+          gh api --paginate "repos/${GH_REPO}/releases/${id}/assets" > assets.json
+          n="$(jq '[.[] | select(.state=="uploaded") | select(.name | endswith(".tar.gz"))] | length' assets.json)"
+          [ "$n" -ge 1 ] \
+            || { echo "::error::release ${RELEASE_TAG} has 0 uploaded tarballs - refusing to reconcile"; exit 1; }
+          echo "uploaded tarballs on the release: $n"
+
+      - name: List CDN services/ (recursive)
+        run: |
+          set -euo pipefail
+          bash scripts/bunny-list.sh services/ > listing.json
+          echo "CDN objects under services/: $(jq 'length' listing.json)"
+
+      - name: Compute reconcile plan
+        run: |
+          set -euo pipefail
+          source scripts/lib.sh
+          args=(--assets-json assets.json --cdn-listing listing.json --checksum-mode "$CDN_CHECKSUM_MODE")
+          # Compare against the literal "true": a dispatch boolean is the string "false"
+          # when unchecked, which is non-empty, so a `${VERIFY:+...}` idiom would make this
+          # flag permanently ON and un-opt-out-able.
+          [ "${VERIFY:-false}" = "true" ] && args+=(--verify-checksums)
+          scripts/cdn-reconcile-plan.sh "${args[@]}" > plan.json
+          echo "mode=$CDN_CHECKSUM_MODE verify=${VERIFY:-false}"
+
+      # Blank the delete set when additive-only was requested, then enforce the cap. Always
+      # print the (possibly-adjusted) plan to the summary — this is the human review gate for
+      # a dry run. Both labels are read from plan.json, never from inputs.*, so the banner
+      # cannot disagree with what the classifier actually did.
+      - name: Review plan + guard deletes
+        id: guard
+        run: |
+          set -euo pipefail
+          # Validate max_deletes before it is used as a cap. It is a free-text `type: string`
+          # input, and `[ "$n" -gt "$MAX_DELETES" ]` on a non-numeric value exits 2 with
+          # "integer expected" — which, sitting in an `if` condition, is swallowed by set -e and
+          # read as false. The cap would then be silently inert on the one destructive path.
+          case "${MAX_DELETES:-}" in
+            ''|*[!0-9]*) echo "::error::max_deletes must be a non-negative integer, got '${MAX_DELETES:-}'"; exit 1 ;;
+          esac
+          if [ "$INCLUDE_DELETES" != "true" ]; then
+            jq '.to_delete = []' plan.json > plan.adj.json && mv plan.adj.json plan.json
+          fi
+          n_up=$(jq '.to_upload | length' plan.json)
+          n_ch=$(jq '.to_update | length' plan.json)
+          n_del=$(jq '.to_delete | length' plan.json)
+          n_unv=$(jq '.unverified | length' plan.json)
+          n_so=$(jq '.size_only | length' plan.json)
+          n_nu=$(jq '.not_uploaded | length' plan.json)
+          mode=$(jq -r '.checksum_mode' plan.json)
+          vrf=$(jq -r '.verify_checksums' plan.json)
+          {
+            echo "### CDN sync plan ($([ "$APPLY" = "true" ] && echo APPLY || echo 'dry run'))"
+            echo ""
+            echo "- upload: **$n_up** / update: **$n_ch** / delete: **$n_del**"
+            echo "- comparison: \`$mode\` — hash-compared $(jq -r '.counts.hash_compared' plan.json), size-compared $(jq -r '.counts.size_compared' plan.json), desired $(jq -r '.counts.desired' plan.json)"
+            if [ "$vrf" = "true" ] && [ "$mode" != "hash" ]; then
+              echo "- **FULL-MIRROR REPAIR**: \`verify_checksums\` forced $n_ch object(s) — this moves"
+              echo "  the whole mirror and blocks releases for its duration. On a \`$mode\` zone,"
+              echo "  size-only comparison is the expected steady state and needs no repair."
+            fi
+            if [ "$mode" = "hash" ] && [ "$n_unv" -gt 0 ]; then
+              echo "- unverified: **$n_unv** (could not be hash-compared; re-run with \`verify_checksums\` to repair)"
+              jq -r '.unverified[] | "  - `" + . + "`"' plan.json
+            fi
+            # size_only is reported WITHOUT a call to action: outside `hash` it is every
+            # object and is expected, so presenting it as a cue would never converge.
+            [ "$n_so" -gt 0 ] && echo "- size-only compared: **$n_so** (expected on a \`$mode\` zone)"
+            if [ "$n_nu" -gt 0 ]; then
+              echo "- **not yet uploaded on GitHub: $n_nu** — their CDN objects were PRESERVED and they"
+              echo "  are absent from the regenerated services.json. Re-run after finalize completes."
+              jq -r '.not_uploaded[] | "  - `" + . + "`"' plan.json
+            fi
+            if [ "$n_del" -gt 0 ]; then
+              echo ""
+              echo "<details><summary>Deletions</summary>"
+              echo ""
+              jq -r '.to_delete[] | "- `" + . + "`"' plan.json
+              echo ""
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$n_del" -gt "$MAX_DELETES" ]; then
+            echo "::error::plan would delete $n_del objects (> max_deletes=$MAX_DELETES); raise max_deletes to proceed"
+            exit 1
+          fi
+          echo "n_del=$n_del" >> "$GITHUB_OUTPUT"
+
+      - name: Dry run notice
+        if: ${{ inputs.apply != true }}
+        run: echo "Dry run only. Re-run with apply=true to execute this plan."
+
+      - name: Apply uploads + updates
+        id: uploads
+        if: ${{ inputs.apply == true }}
+        run: |
+          set -euo pipefail
+          source scripts/lib.sh
+          : > written_urls.txt
+          jq -r '(.to_upload + .to_update)[]' plan.json | while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            gh release download "$RELEASE_TAG" --pattern "$name" --dir dl --clobber
+            dig="$(jq -r --arg n "$name" \
+              '.[] | select(.name==$n) | (.digest // "") | sub("^sha256:";"")' assets.json)"
+            # Local verify when a digest exists — cheap guard against corruption between
+            # GitHub and Bunny. Skipped (not failed) when the digest is null.
+            if [ -n "$dig" ]; then
+              echo "${dig}  dl/${name}" | sha256sum -c - >/dev/null \
+                || { echo "::error::local digest mismatch for $name"; exit 1; }
+            fi
+            if [ "$CDN_CHECKSUM_MODE" = noheader ]; then
+              bash scripts/bunny-put.sh "dl/$name" "services/$name"
+            else
+              bash scripts/bunny-put.sh "dl/$name" "services/$name" "$dig"
+            fi
+            echo "https://${PULLZONE}/services/${name}" >> written_urls.txt
+          done
+
+      # Regenerate the manifest from the same asset snapshot with the same generator
+      # finalize uses, and write both copies (root + the services/ contract copy).
+      # One deliberate difference from finalize: the state filter, so a half-uploaded asset
+      # never enters the listing.
+      - name: Regenerate + upload the manifest
+        id: manifest
+        if: ${{ inputs.apply == true }}
+        run: |
+          set -euo pipefail
+          source scripts/lib.sh
+          jq -r '.[] | select(.state=="uploaded") | .name' assets.json \
+            | { grep '\.tar\.gz$' || true; } | LC_ALL=C sort \
+            | scripts/gen-manifest.sh > services.json
+          dig="$(sha256sum services.json | cut -d' ' -f1)"
+          if [ "$CDN_CHECKSUM_MODE" = noheader ]; then
+            bash scripts/bunny-put.sh services.json services/services.json
+            bash scripts/bunny-put.sh services.json services.json
+          else
+            bash scripts/bunny-put.sh services.json services/services.json "$dig"
+            bash scripts/bunny-put.sh services.json services.json "$dig"
+          fi
+
+      # Purge written artifacts FIRST, then the manifest — both orderings matter and this
+      # satisfies them together: artifacts before the manifest so a negatively-cached URL
+      # cannot 404 while the manifest advertises it, and the manifest before the deletes in
+      # the next step so the edge never serves a listing naming objects already removed.
+      # bunny-purge.sh purges sequentially with async=false, so argument order is meaningful.
+      - name: Purge written artifacts + manifest
+        id: purge_written
+        if: ${{ inputs.apply == true }}
+        run: |
+          set -euo pipefail
+          urls=()
+          if [ -s written_urls.txt ]; then
+            while IFS= read -r u; do [ -n "$u" ] && urls+=("$u"); done < written_urls.txt
+          fi
+          urls+=("https://${PULLZONE}/services/services.json" "https://${PULLZONE}/services.json")
+          bash scripts/bunny-purge.sh "${urls[@]}"
+
+      # bunny-delete.sh independently refuses anything outside services/. Append each URL as
+      # its DELETE succeeds so the next step can purge whatever got through even if this one
+      # dies mid-loop; note the `jq | while` body runs in a subshell, so an array would be
+      # lost at the pipe boundary — hence the file.
+      - name: Apply deletes
+        id: deletes
+        if: ${{ inputs.apply == true && inputs.include_deletes == true && steps.guard.outputs.n_del != '0' }}
+        run: |
+          set -euo pipefail
+          : > deleted_urls.txt
+          jq -r '.to_delete[]' plan.json | while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            bash scripts/bunny-delete.sh "$path"
+            echo "https://${PULLZONE}/${path}" >> deleted_urls.txt
+          done
+
+      # The one always() step, and therefore self-guarding: always() alone would also defeat
+      # the apply/include_deletes gates, and bunny-purge.sh hard-fails on zero arguments —
+      # which would redden the mandatory dry run. The -s test also covers the skipped paths
+      # where deleted_urls.txt was never created.
+      - name: Purge deleted URLs
+        if: ${{ always() && inputs.apply == true && inputs.include_deletes == true }}
+        run: |
+          set -euo pipefail
+          [ -s deleted_urls.txt ] || { echo "no deletions to purge"; exit 0; }
+          xargs -a deleted_urls.txt bash scripts/bunny-purge.sh
+
+      # Report the ACTUAL outcome of the apply steps rather than claiming success because
+      # the run reached this point — a partial backfill (say Bunny 500s on object 5) skips the
+      # manifest write and both purges, so "Applied." would tell the operator the CDN is ready
+      # when services/services.json was never written at all. That is exactly the gate the
+      # README says to clear before pointing a consumer at the CDN.
+      - name: Summarize
+        if: always()
+        env:
+          UPLOADS: ${{ steps.uploads.outcome }}
+          MANIFEST: ${{ steps.manifest.outcome }}
+          PURGE_WRITTEN: ${{ steps.purge_written.outcome }}
+          DELETES: ${{ steps.deletes.outcome }}
+        run: |
+          set -uo pipefail
+          {
+            echo ""
+            if [ "$APPLY" != "true" ]; then
+              echo "Dry run — nothing was mutated. Re-run with \`apply=true\` to execute this plan."
+            elif [ "$UPLOADS" = "success" ] && [ "$MANIFEST" = "success" ]; then
+              echo "Applied. Consumer base: \`https://${PULLZONE}/services\` (listing at"
+              echo "\`{base}/services.json\`, artifacts at \`{base}/<filename>\`)."
+              echo ""
+              echo "- purge: ${PURGE_WRITTEN} / deletes: ${DELETES}"
+            else
+              echo "**Apply did not complete — the CDN may be partial.**"
+              echo ""
+              echo "- uploads: ${UPLOADS} / manifest: ${MANIFEST} / purge: ${PURGE_WRITTEN} / deletes: ${DELETES}"
+              echo "- GitHub Releases remains the source of truth. Re-run this workflow to reconcile;"
+              echo "  do NOT point a consumer at the CDN until an apply run completes cleanly."
+            fi
+            # Guarded with `if`, not `&&`: GitHub runs steps as `bash -e {0}`, so -e is on
+            # regardless of this step's own set line, and a failed `&&` list as the final command
+            # would redden this always() step on every run that failed before the plan existed.
+            if [ -f plan.json ]; then
+              echo "- comparison mode: \`$(jq -r '.checksum_mode' plan.json)\` / verify_checksums: \`$(jq -r '.verify_checksums' plan.json)\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
