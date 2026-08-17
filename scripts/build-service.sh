@@ -328,15 +328,28 @@ if [[ "$OS" == windows ]]; then
       # C:/... form is resolved identically by both runtimes.
       src_m="$(cygpath -m "$work/redis")"
       shim_m="$(cygpath -m "$shim")"
+      # Drop -Werror from the VENDORED hiredis (deps/hiredis/Makefile:42). Under the
+      # emulation layer isprint()/isspace() are macros that index an array with their char
+      # argument, so -Wchar-subscripts (implied by -Wall) fires on hiredis's sds.c, and
+      # hiredis's own -Werror turns that into a hard failure. glibc implements those macros
+      # differently, which is why this never trips on the unix legs. It cannot be fixed via
+      # CFLAGS: hiredis puts $(CFLAGS) BEFORE $(WARNINGS) in REAL_CFLAGS, so -Wall re-enables
+      # the warning after anything we pass. hiredis is the only dep using -Werror. The edit
+      # is confined to the extracted tree, which is deleted on exit.
+      sed -i 's/ -Werror//' "$work/redis/deps/hiredis/Makefile"
       jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
-      # No other patching is needed at 7.2.x, and two plausible-looking patches are
-      # deliberately absent because the source says they are wrong:
+      # Two plausible-looking patches are deliberately absent because the source says they
+      # are wrong:
       #   - src/mkreleasehdr.sh needs NO stub. It tolerates a missing git checkout by design
       #     (`git show-ref … || echo 00000000`), and hand-writing release.h in its place
       #     breaks the build — the real one also emits `#include "version.h"` and
       #     REDIS_BUILD_ID_RAW, which release.c requires.
       #   - there is no `module_tests` target in 7.2.15's src/Makefile to drop.
       # MALLOC=libc because jemalloc does not build against the emulation layer.
+      # NOTE: src/Makefile's deps line (`-(cd ../deps && $(MAKE) …)`) has a leading `-`, so
+      # make IGNORES a deps failure and only reports it later as a missing .a at link time.
+      # If this build fails with "cannot find ../deps/<x>/lib<x>.a", the real error is
+      # earlier in the log, inside that dep's compile.
       "$msys_bash" -lc "cd '$src_m' && make -j$jobs BUILD_TLS=no MALLOC=libc CFLAGS='-I$shim_m'" \
         || { echo "redis(windows): source build failed" >&2; exit 1; }
       cp "$work/redis/src/redis-server.exe" "$work/redis/src/redis-cli.exe" "$stage/bin/"
