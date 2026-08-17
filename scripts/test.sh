@@ -41,6 +41,9 @@ eq "meilisearch linux-x86_64"  "meilisearch-1.49.0-linux-x86_64.tar.gz"  "$(arti
 eq "meilisearch linux-aarch64" "meilisearch-1.49.0-linux-aarch64.tar.gz" "$(artifact_filename meilisearch 1.49.0 linux aarch64)"
 eq "meilisearch macos-aarch64" "meilisearch-1.49.0-macos-aarch64.tar.gz" "$(artifact_filename meilisearch 1.49.0 macos aarch64)"
 eq "canonical_service passthrough" "meilisearch" "$(canonical_service meilisearch)"
+# The Windows redis leg publishes under its OWN Redis version, not the Valkey label.
+eq "redis windows 7.2.15" "redis-7.2.15-windows-x86_64.tar.gz" "$(artifact_filename redis 7.2.15 windows x86_64)"
+eq "canonical_service valkey->redis" "redis" "$(canonical_service valkey)"
 
 echo "== 2. archive layout + 3. executable permissions =="
 # Stage exactly as the recipe does: bin/meilisearch (executable) + LICENSE files at the root.
@@ -81,6 +84,23 @@ plats="$(jq -c '.services.meilisearch.versions[0].platforms' <<<"$mani")"
 contains "has linux-x86_64"  "$plats" '"linux-x86_64"'
 contains "has linux-aarch64" "$plats" '"linux-aarch64"'
 contains "has macos-aarch64" "$plats" '"macos-aarch64"'
+
+echo "== 4b. redis slot: version lists are disjoint per platform =="
+# The post-cutover redis asset set. This pins the whole point of the Windows rename as a
+# test rather than a hope: the Valkey label must never regain a windows platform, and the
+# Redis label must never gain a unix one. A regression in set-matrix's redis filter shows
+# up here as `9.1.0` sprouting windows-x86_64.
+names_redis=$'redis-9.1.0-linux-x86_64.tar.gz\nredis-9.1.0-linux-aarch64.tar.gz\nredis-9.1.0-macos-aarch64.tar.gz\nredis-7.2.15-windows-x86_64.tar.gz'
+rmani="$(printf '%s\n' "$names_redis" | "$gen")"
+eq "redis has two version entries" "2" "$(jq -r '.services.redis.versions | length' <<<"$rmani")"
+r72="$(jq -c '.services.redis.versions[] | select(.version=="7.2.15") | .platforms' <<<"$rmani")"
+r91="$(jq -c '.services.redis.versions[] | select(.version=="9.1.0")  | .platforms' <<<"$rmani")"
+eq "7.2.15 is windows-only"     '["windows-x86_64"]' "$r72"
+eq "9.1.0 has three platforms"  "3" "$(jq -r 'length' <<<"$r91")"
+absent "9.1.0 has NO windows leg" "$r91" 'windows'
+contains "9.1.0 has linux-x86_64"  "$r91" '"linux-x86_64"'
+contains "9.1.0 has linux-aarch64" "$r91" '"linux-aarch64"'
+contains "9.1.0 has macos-aarch64" "$r91" '"macos-aarch64"'
 
 echo "== 5. exclusion of failed/untested platforms =="
 # macos-x86_64 is never published (no Intel runner); a hypothetical failed leg simply has no

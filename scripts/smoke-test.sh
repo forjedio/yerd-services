@@ -80,12 +80,41 @@ if [[ "$OS" == windows ]]; then
   case "$service" in
     redis)
       mkdir -p "$data"
-      "$bin/redis-server.exe" --port "$port" --dir "$data" --save '' --appendonly no &
+      # Derive the version the FILENAME claims, and assert the binary agrees. The label
+      # comes from the workflow's `version` input while the binary comes from the
+      # independent REDIS_WIN_UPSTREAM, so without this a dispatch pairing the two
+      # incorrectly would publish an artifact whose name lies about its contents — the exact
+      # defect the Windows leg's own version label exists to eliminate. A `7.2.` prefix
+      # match cannot catch it; assert the exact string.
+      rb="$(basename "$tarball" .tar.gz)"        # redis-<version>-<os>-<arch>
+      rb="${rb%-*}"; rb="${rb%-*}"               # strip -<arch>, then -<os>
+      want_ver="${rb#redis-}"
+      [[ -n "$want_ver" && "$want_ver" != "$rb" ]] \
+        || { echo "redis: cannot parse version from tarball name '$tarball'" >&2; exit 1; }
+      # --dir takes a FORWARD-SLASH Windows path. The binary is built under MSYS2, whose
+      # runtime mangles backslashed argv paths, so this is the invocation shape the daemon
+      # must use — proving it here keeps that contract honest.
+      "$bin/redis-server.exe" --port "$port" --dir "$(cygpath -m "$data")" \
+        --save '' --appendonly no &
       srv_pid=$!
       wait_for 15 "$bin/redis-cli.exe" -p "$port" ping
       [[ "$("$bin/redis-cli.exe" -p "$port" ping)" == "PONG" ]] || { echo "redis: no PONG" >&2; exit 1; }
+      got_ver="$("$bin/redis-cli.exe" -p "$port" INFO server \
+        | tr -d '\r' | sed -n 's/^redis_version:\(.*\)$/\1/p')"
+      [[ "$got_ver" == "$want_ver" ]] \
+        || { echo "redis: artifact named '$want_ver' reports redis_version:'$got_ver'" >&2; exit 1; }
       "$bin/redis-cli.exe" -p "$port" set yerd ok >/dev/null
       [[ "$("$bin/redis-cli.exe" -p "$port" get yerd)" == "ok" ]] || { echo "redis: SET/GET failed" >&2; exit 1; }
+      # BGSAVE exercises fork(), which MSYS2 EMULATES rather than provides. It is the one
+      # runtime behaviour most likely to break for users and completely invisible to PING.
+      # Poll for completion rather than sleeping a fixed interval (a fixed sleep is a flake
+      # source), then require the save actually succeeded.
+      "$bin/redis-cli.exe" -p "$port" BGSAVE >/dev/null
+      wait_for 30 bash -c \
+        "\"$bin/redis-cli.exe\" -p $port INFO persistence | tr -d '\r' | grep -q '^rdb_bgsave_in_progress:0'"
+      [[ "$("$bin/redis-cli.exe" -p "$port" INFO persistence \
+        | tr -d '\r' | sed -n 's/^rdb_last_bgsave_status:\(.*\)$/\1/p')" == "ok" ]] \
+        || { echo "redis: BGSAVE failed (fork emulation broken?)" >&2; exit 1; }
       "$bin/redis-cli.exe" -p "$port" shutdown nosave 2>/dev/null || true
       ;;
 

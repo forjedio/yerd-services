@@ -42,11 +42,14 @@ on:
         options: [all, linux-x86_64, linux-aarch64, macos-aarch64, windows-x86_64]
       redis_win_upstream:
         description: >-
-          redis slot only — Windows ships the native MSVC Redis port (Valkey doesn't build
-          on Windows), so its version is independent of the Valkey `upstream`. Default pinned.
+          redis slot only — Windows builds vanilla REDIS from source under MSYS2 (Valkey has
+          no Windows build), so its version is independent of the Valkey `upstream`. Leave
+          EMPTY to use the version pinned in scripts/lib.sh. A non-pinned value fails: the
+          version and its sha256 are pinned together there, so bumping is a reviewed commit.
+          When building the Windows leg, pass this same value as `version`.
         type: string
         required: false
-        default: "5.0.14.1"
+        default: ""
       postgres_win_buildno:
         description: >-
           postgres slot only — EDB windows-x64 binaries build-number suffix (e.g. 1).
@@ -86,9 +89,10 @@ env:
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GH_REPO: ${{ github.repository }}
   RELEASE_TAG: services
-  # Windows redis ships the native MSVC Redis port (platform-divergent from the Valkey
-  # `upstream`); postgres needs the EDB build-number suffix (empty -> probe). Both are
-  # ignored by non-Windows legs / non-matching services. Read by build-service.sh / lib.sh.
+  # Windows redis builds vanilla Redis from source under MSYS2 (platform-divergent from the
+  # Valkey `upstream`; empty -> the version pinned in lib.sh); postgres needs the EDB
+  # build-number suffix (empty -> probe). Both are ignored by non-Windows legs /
+  # non-matching services. Read by build-service.sh / lib.sh.
   REDIS_WIN_UPSTREAM: ${{ inputs.redis_win_upstream }}
   POSTGRES_WIN_BUILDNO: ${{ inputs.postgres_win_buildno }}
   # postgres `full` variant on Windows: pin the OSGeo PostGIS bundle version, or leave empty
@@ -130,12 +134,25 @@ jobs:
       - id: gen
         run: |
           all='[{"runner":"ubuntu-latest","target":"linux-x86_64"},{"runner":"ubuntu-24.04-arm","target":"linux-aarch64"},{"runner":"macos-14","target":"macos-aarch64"},{"runner":"windows-latest","target":"windows-x86_64"}]'
-          # Every service now covers all four platforms: meilisearch builds from Rust source on
-          # windows-latest (emitting meilisearch.exe) and versitygw repackages upstream's prebuilt
-          # Windows binary — so there is no per-service Windows drop here anymore. A single target
-          # can still be rebuilt in isolation via the `targets` input below (e.g. windows-x86_64).
+          # Every service covers all four platforms, EXCEPT the redis slot on Windows — see
+          # below. A single target can still be rebuilt in isolation via the `targets` input
+          # (e.g. windows-x86_64).
           if [[ "${{ inputs.targets }}" == "all" ]]; then
             inc="$(jq -c '.' <<<"$all")"
+            # The redis slot is version-divergent, not just implementation-divergent: unix
+            # ships Valkey <upstream>, Windows ships REDIS 7.2.x under its OWN version label.
+            # build-service.sh derives the artifact filename from the `version` input alone,
+            # so leaving windows in the `all` set would make the next routine Valkey dispatch
+            # (-f service=valkey -f version=9.2) publish redis-9.2-windows-x86_64.tar.gz —
+            # silently relabelling a Redis build with a Valkey version. Windows redis is
+            # therefore an EXPLICIT `targets=windows-x86_64` dispatch; see README's release
+            # flow for the two-dispatch procedure.
+            # Filter `inc`, NOT `all`: the explicit-target branch below selects from `$all`,
+            # so filtering at the definition would zero out that very dispatch.
+            case "${{ inputs.service }}" in
+              valkey|redis)
+                inc="$(jq -c '[.[] | select(.target != "windows-x86_64")]' <<<"$inc")" ;;
+            esac
           else
             inc="$(jq -c --arg t "${{ inputs.targets }}" '[.[] | select(.target == $t)]' <<<"$all")"
           fi

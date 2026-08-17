@@ -290,17 +290,101 @@ if [[ "$OS" == windows ]]; then
   # vendor zips keep their runtime DLLs in bin/ (NOT lib/), so win_stage_bin copies them.
   case "$service" in
     redis)
-      # Windows ships REDIS (native MSVC port), not Valkey (valkey #92: no Windows build).
-      # Upstream is platform-divergent: ignore the Valkey tag, use the pinned Redis-port
-      # version. Real names kept (redis-server.exe/redis-cli.exe) — no rename to valkey-*.
-      win_up="${REDIS_WIN_UPSTREAM:-5.0.14.1}"
+      # Windows ships REDIS built FROM SOURCE, not Valkey (valkey has no Windows build).
+      # Upstream is platform-divergent: ignore the Valkey tag and use the version pinned in
+      # lib.sh. Real names kept (redis-server.exe/redis-cli.exe) — no rename to valkey-*.
+      #
+      # Built under MSYS2 because Redis cannot be built natively on Windows: src/Makefile
+      # has no MINGW/CYGWIN branch, and the sources need sys/mman.h, sys/un.h, syslog.h and
+      # sys/wait.h, which mingw-w64 does not ship. The consequence is deliberate and
+      # documented in README's Windows provenance table: the artifact carries msys-*.dll,
+      # and callers must pass FORWARD-SLASH paths (C:/...) — a backslashed Windows path is
+      # mangled by the runtime's argv handling.
+      win_up="${REDIS_WIN_UPSTREAM:-$REDIS_WIN_UPSTREAM_DEFAULT}"
+      msys_root="$(ensure_msys2)" || { echo "redis(windows): MSYS2 toolchain unavailable" >&2; exit 1; }
+      msys_bash="$msys_root/usr/bin/bash.exe"
       url="$(redis_win_url "$win_up")"
+      sha="$(redis_win_sha256 "$win_up")" || exit 1
       echo ">> redis(windows) source: $url"
-      fetch_to "$url" "$work/redis.zip"
-      unzip_vendor "$work/redis.zip" "$work/r"
-      root="$(vendor_root "$work/r")"
-      win_stage_bin "$root" "$stage" redis-server.exe redis-cli.exe
-      windows_bundle_runtime "$stage"
+      fetch_to "$url" "$work/redis.tar.gz"
+      echo "${sha}  $work/redis.tar.gz" | sha256sum -c - >/dev/null \
+        || { echo "redis(windows): sha256 mismatch for $url" >&2; exit 1; }
+      mkdir -p "$work/redis"
+      tar xf "$work/redis.tar.gz" -C "$work/redis" --strip-components 1
+      # Header shim, NOT `sed -i /usr/include/dlfcn.h`. That header belongs to
+      # msys2-runtime-devel and lives outside the build tree; this script is documented as
+      # runnable locally (see the header comment) and ensure_msys2 targets a developer's own
+      # MSYS2 install, so an in-place edit would permanently corrupt it. Copy the header,
+      # patch the copy, and put the copy first on the include path instead. src/Makefile
+      # folds CFLAGS into FINAL_CFLAGS for every translation unit, and -I always precedes
+      # the system include dirs. If this ever stops taking effect, stop and report — do not
+      # fall back to editing the system header.
+      shim="$work/shim"
+      mkdir -p "$shim"
+      cp "$msys_root/usr/include/dlfcn.h" "$shim/dlfcn.h"
+      sed -i 's/__GNU_VISIBLE/1/' "$shim/dlfcn.h"
+      # Both paths cross into MSYS2 bash, so both need cygpath -m: a Git Bash path like
+      # /tmp/... resolves against MSYS2's OWN root mount, silently pointing elsewhere. The
+      # C:/... form is resolved identically by both runtimes.
+      src_m="$(cygpath -m "$work/redis")"
+      shim_m="$(cygpath -m "$shim")"
+      # Drop -Werror from the VENDORED hiredis (deps/hiredis/Makefile:42). Under the
+      # emulation layer isprint()/isspace() are macros that index an array with their char
+      # argument, so -Wchar-subscripts (implied by -Wall) fires on hiredis's sds.c, and
+      # hiredis's own -Werror turns that into a hard failure. glibc implements those macros
+      # differently, which is why this never trips on the unix legs. It cannot be fixed via
+      # CFLAGS: hiredis puts $(CFLAGS) BEFORE $(WARNINGS) in REAL_CFLAGS, so -Wall re-enables
+      # the warning after anything we pass. hiredis is the only dep using -Werror. The edit
+      # is confined to the extracted tree, which is deleted on exit.
+      sed -i 's/ -Werror//' "$work/redis/deps/hiredis/Makefile"
+      jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+      # Two plausible-looking patches are deliberately absent because the source says they
+      # are wrong:
+      #   - src/mkreleasehdr.sh needs NO stub. It tolerates a missing git checkout by design
+      #     (`git show-ref … || echo 00000000`), and hand-writing release.h in its place
+      #     breaks the build — the real one also emits `#include "version.h"` and
+      #     REDIS_BUILD_ID_RAW, which release.c requires.
+      #   - there is no `module_tests` target in 7.2.15's src/Makefile to drop.
+      # MALLOC=libc because jemalloc does not build against the emulation layer.
+      # NOTE: src/Makefile's deps line (`-(cd ../deps && $(MAKE) …)`) has a leading `-`, so
+      # make IGNORES a deps failure and only reports it later as a missing .a at link time.
+      # If this build fails with "cannot find ../deps/<x>/lib<x>.a", the real error is
+      # earlier in the log, inside that dep's compile.
+      # OPTIMIZATION=-O2 is LOAD-BEARING, not a preference. src/Makefile:20-27 turns on LTO
+      # (`-flto=auto` + `-flto` at link) whenever OPTIMIZATION is exactly `-O3`, its default.
+      # Under gcc 15 targeting the emulation layer, that LTO build produces a binary which
+      # starts, exits 0 and does nothing at all — no output even from `--version`, and no
+      # server. -O2 misses the `ifeq` guard, so LTO never engages and the binary works, while
+      # keeping real optimisation (the reference project reaches for -O0, which is not
+      # necessary). If a future bump reverts to -O3, the smoke test's version assertion is
+      # what will catch it: an inert binary reports no version at all.
+      "$msys_bash" -lc "cd '$src_m' && make -j$jobs BUILD_TLS=no MALLOC=libc OPTIMIZATION=-O2 CFLAGS='-I$shim_m'" \
+        || { echo "redis(windows): source build failed" >&2; exit 1; }
+      cp "$work/redis/src/redis-server.exe" "$work/redis/src/redis-cli.exe" "$stage/bin/"
+      # Stage the POSIX runtime the built exes need. Derive the set with ldd rather than
+      # hardcoding it — the exact msys-*.dll list varies with the runtime build. ldd is
+      # TRANSITIVE, which matters here: windows_self_contain_gate only scans *.exe, never
+      # the DLLs themselves, so a DLL-of-a-DLL that we failed to stage would sail past the
+      # gate and only surface as a load failure at runtime. If ldd is unavailable, fall back
+      # to staging every msys-*.dll — over-inclusive but transitively complete by
+      # construction. The spike log records which path ran.
+      stage_m="$(cygpath -m "$stage")"
+      "$msys_bash" -lc "set -e
+        cd '$stage_m/bin'
+        if command -v ldd >/dev/null 2>&1; then
+          echo '>> staging msys runtime via ldd'
+          ldd redis-server.exe redis-cli.exe \
+            | grep -oE '/usr/bin/msys-[^ ]+\.dll' | sort -u \
+            | while read -r d; do cp -n \"\$d\" '$stage_m/bin/'; done
+        else
+          echo '>> ldd unavailable; staging all msys-*.dll'
+          cp -n /usr/bin/msys-*.dll '$stage_m/bin/'
+        fi" \
+        || { echo "redis(windows): could not stage msys runtime DLLs" >&2; exit 1; }
+      ls "$stage/bin" | grep -qi '^msys-' \
+        || { echo "redis(windows): no msys runtime DLL staged into bin/" >&2; exit 1; }
+      # No windows_bundle_runtime here: nothing links the MSVC CRT — the POSIX runtime
+      # staged above is the whole dependency story for this arm.
       windows_self_contain_gate "$stage"
       require_files "$stage" bin/redis-server.exe bin/redis-cli.exe
       ;;
@@ -728,12 +812,15 @@ fi
 # MySQL — which we additionally modify via install_name_tool/codesign on macOS — and
 # good practice for the others).
 if [[ "$OS" == windows && "$service" == redis ]]; then
-  # Windows redis is the native MSVC port of REDIS (pre-7.4 BSD-3), not Valkey. Ship the
-  # upstream Redis BSD license, the port's combined BSD-3 notice, AND the notices for the
-  # permissive deps statically linked into redis-server.exe (Lua/hiredis/jemalloc/linenoise),
-  # all required for binary redistribution.
+  # Windows redis is REDIS built from source (BSD-3, <= 7.2), not Valkey. Ship the upstream
+  # Redis license taken verbatim from the exact tree that was built (the meilisearch
+  # pattern), the notices for the permissive deps statically linked into redis-server.exe,
+  # and the LGPLv3 text for the MSYS2 runtime DLLs bundled into bin/ — all required for
+  # binary redistribution.
+  [[ -f "$work/redis/COPYING" ]] && cp "$work/redis/COPYING" "$stage/LICENSE"
+  [[ -f "$stage/LICENSE" ]] || cp "$repo_root/LICENSES/redis-BSD-3-Clause.txt" "$stage/LICENSE"
   mkdir -p "$stage/LICENSES"
-  for l in redis-BSD-3-Clause.txt redis-windows-port-BSD-3-Clause.txt redis-windows-third-party-NOTICES.txt; do
+  for l in redis-windows-third-party-NOTICES.txt msys2-runtime-LGPL-3.0.txt; do
     [[ -f "$repo_root/LICENSES/$l" ]] || { echo "missing LICENSES/$l" >&2; exit 1; }
     cp "$repo_root/LICENSES/$l" "$stage/LICENSES/$l"
   done

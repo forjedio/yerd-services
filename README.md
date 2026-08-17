@@ -44,6 +44,15 @@ gh workflow run release.yml \
   -f action=build -f service=valkey -f version=9.1 -f upstream=9.1.0
 #  → builds all platforms, uploads redis-9.1-*.tar.gz, refreshes services.json.
 #    Everything else (redis 9.0, mysql, …) is untouched.
+#
+#    EXCEPT the redis slot, which takes TWO dispatches: `targets=all` yields only the
+#    three UNIX legs (Valkey), because Windows redis is a different product at a
+#    different version (Redis 7.2.x) and must not inherit the Valkey label. Build it
+#    separately, passing the Redis version as BOTH `version` and `redis_win_upstream`:
+gh workflow run release.yml \
+  -f action=build -f service=redis -f version=7.2.15 -f upstream=7.2.15 \
+  -f targets=windows-x86_64 -f redis_win_upstream=7.2.15
+#  → uploads redis-7.2.15-windows-x86_64.tar.gz. The unix Valkey label is untouched.
 
 # EXCLUDE a bad version — e.g. pull Valkey 9.0:
 gh workflow run release.yml \
@@ -95,10 +104,13 @@ and points data/socket/port at user paths via config, never compiled-in defaults
   runtime) lives in `bin/`, *not* `lib/`. (`windows_self_contain_gate` enforces this.)
 - `mysql` omits `mysqld_safe` (a Unix-only shell script). `mariadb`'s init tool is
   `mariadb-install-db.exe` or `mysql_install_db.exe` (version-dependent).
-- The `redis` slot ships the real **Redis** port binaries `redis-server.exe` / `redis-cli.exe`
-  — *not* renamed to `valkey-*`, because on Windows it genuinely is Redis (pre-7.4 BSD), not
+- The `redis` slot ships the real **Redis** binaries `redis-server.exe` / `redis-cli.exe`
+  — *not* renamed to `valkey-*`, because on Windows it genuinely is Redis (7.2.x, BSD-3), not
   Valkey (which has no native Windows build). So the redis slot's server-binary name is
-  platform-divergent.
+  platform-divergent — and so is its **version**: the Windows leg is published under its own
+  Redis version label, so the redis slot's version lists are **disjoint per platform**
+  (`services.json` shows `7.2.15` with only `windows-x86_64`, and the Valkey label with only
+  the three unix platforms). A consumer resolving a version must filter by host platform.
 
 **Listing (`services.json`):** GitHub Releases has no directory autoindex, so the workflow
 publishes a generated `services.json` manifest as a release asset; the daemon fetches it to
@@ -246,7 +258,7 @@ group, so a queued run can be superseded by a later dispatch).
 
 | service | version | upstream source | how | notes |
 |---------|---------|-----------------|-----|-------|
-| `redis` | _(label)_ | [Valkey](https://github.com/valkey-io/valkey) tag `<upstream>` | build from source | `make -j BUILD_TLS=no` |
+| `redis` | _(label)_ | [Valkey](https://github.com/valkey-io/valkey) tag `<upstream>` | build from source | `make -j BUILD_TLS=no`. **Unix only.** The slot is platform-divergent in *version* as well as implementation: Linux/macOS ship Valkey `<upstream>`, Windows ships **Redis 7.2.x** under its own version label (Valkey forked from Redis 7.2.4, so they share a direct ancestor). See the Windows table below |
 | `mysql` | _(label)_ | [Oracle MySQL](https://dev.mysql.com/downloads/mysql/) generic tarball `<upstream>` (e.g. 8.4.9 LTS) | repackage | `bin/{mysqld,mysql,mysqld_safe,mysqldump}` + bundled `lib/`+`share/`; macOS dylib install-names made relocatable |
 | `postgres` | _(label)_ | [postgresql.org](https://ftp.postgresql.org/pub/source/) source `<upstream>` (e.g. 17.10) | build from source | `./configure --without-icu --without-readline --without-zlib --without-libxml` (no compressed `pg_dump`); macOS made relocatable. Also bundles a curated set of contrib extensions + **pgvector** (`PGVECTOR_UPSTREAM`, default `v0.8.5`) — see [Bundled extensions](#bundled-extensions) |
 | `mariadb` | _(label)_ | [archive.mariadb.org](https://archive.mariadb.org/) `<upstream>` (e.g. 11.8.8 LTS) | repackage (linux-x86_64) / build from source (ARM Linux + macOS) | MariaDB ships only a `linux-systemd-x86_64` bintar; CMake build for the rest (`-DWITH_SSL=system`, heavy plugins trimmed). `bin/{mariadbd,mariadb,mariadb-install-db,my_print_defaults,mariadb-dump,…}` + `lib/`+`share/`; made relocatable + self-contained |
@@ -258,7 +270,7 @@ native Windows ARM64 build, so Windows is x86_64-only; Windows-on-ARM runs x64 v
 
 | service | windows source | notes |
 |---------|----------------|-------|
-| `redis` | [tporadowski/redis](https://github.com/tporadowski/redis) `Redis-x64-<redis_win_upstream>.zip` (default `5.0.14.1`) | **native MSVC port of Redis (pre-7.4, BSD-3) — NOT Valkey** (valkey has no Windows build). Version is independent of the Valkey `<upstream>` (set via `redis_win_upstream`). Note the version skew: Windows redis is 5.x while Linux/macOS run Valkey 8/9.x. Ships real `redis-server.exe`/`redis-cli.exe` (plus the port's `EventLog.dll`, covered by the port's BSD-3 notice). redis-server.exe statically links Lua/hiredis/jemalloc/linenoise — their notices ship in `redis-windows-third-party-NOTICES.txt`. |
+| `redis` | _(from source)_ [download.redis.io](https://download.redis.io/releases/) `redis-<redis_win_upstream>.tar.gz` (pinned `7.2.15`) | **Vanilla Redis built from source — NOT Valkey** (valkey has no Windows build) and not a third-party prebuilt. **Built under MSYS2/MSYS on `windows-latest`** (`make BUILD_TLS=no MALLOC=libc`): Redis has no MSVC build — `src/Makefile` has no MINGW/CYGWIN branch and the sources need `sys/mman.h`, `sys/un.h`, `syslog.h`, `sys/wait.h`, none of which mingw-w64 provides — so a POSIX emulation layer is mandatory. **The artifact therefore ships `msys-*.dll` in `bin/`** (LGPLv3+ with a linking exception; see `msys2-runtime-LGPL-3.0.txt`) and is the second exception to VC++-runtime bundling after `versitygw`. **Callers must pass forward-slash paths** (`C:/Users/…`): the MSYS2 runtime mangles backslashed argv paths. Version+sha256 are pinned together in `scripts/lib.sh` (digest from [redis/redis-hashes](https://github.com/redis/redis-hashes)); **7.2.x is the ceiling** — 7.4+ is RSALv2/SSPL, 8.0+ adds AGPLv3. Published under its **own** Redis version label, not the Valkey one. Ships `redis-server.exe`/`redis-cli.exe`; statically links Lua/hiredis/fpconv/HdrHistogram/jemalloc/linenoise, notices in `redis-windows-third-party-NOTICES.txt`. |
 | `mysql` | [Oracle MySQL](https://dev.mysql.com/downloads/mysql/) `mysql-<upstream>-winx64.zip` | repackage `bin/` (exes + sibling DLLs) + `share/` + `lib/plugin/`; no `mysqld_safe` |
 | `mariadb` | [archive.mariadb.org](https://archive.mariadb.org/) `mariadb-<upstream>-winx64.zip` | repackage `bin/` + `share/`; init tool `mariadb-install-db.exe`/`mysql_install_db.exe`. **Ships `mysqld.exe` in addition to `mariadbd.exe`**: the init tool execs `bin\mysqld.exe` by that literal name (no fallback to `mariadbd.exe`), so dropping the vendor's compatibility copy makes datadir creation fail |
 | `postgres` | [EDB](https://www.enterprisedb.com/download-postgresql-binaries) `postgresql-<upstream>-<N>-windows-x64-binaries.zip` | repackage `pgsql/{bin,lib,share}`; the build-number `<N>` is set via `postgres_win_buildno` (else probed). The EDB zip already carries the contrib extensions (shipped via the verbatim `lib/`+`share/` copy); **pgvector is not bundled on Windows** — see [Bundled extensions](#bundled-extensions) |
@@ -269,8 +281,12 @@ Every Windows artifact that links the VC++ runtime bundles those DLLs into `bin/
 pass `windows_self_contain_gate` (a `dumpbin -dependents` check, mandatory in CI). The lone
 exception to bundling is `versitygw` — a static Go exe that imports only system DLLs, so it needs
 nothing bundled and passes the gate with an empty bin/ DLL set. The UCRT
-(`ucrtbase`/`api-ms-win-*`) ships with Windows 10+ and is treated as system. No Cygwin is
-used (its `cygwin1.dll` is GPLv3). Redistribution of the bundled VC++ runtime DLLs is
+(`ucrtbase`/`api-ms-win-*`) ships with Windows 10+ and is treated as system. The `redis`
+slot is the other exception: it links no MSVC CRT at all, bundling the MSYS2 POSIX runtime
+(`msys-*.dll`) instead, because Redis cannot be compiled natively on Windows. That runtime —
+and Cygwin's `cygwin1.dll` it forks from — has been **LGPLv3-or-later since Cygwin 2.5.2
+(June 2016)**, not GPLv3 as previously stated here, and carries a linking exception leaving
+the linked executable under its own terms. Redistribution of the bundled VC++ runtime DLLs is
 covered by the folder-level grant for `VC\Redist` (https://aka.ms/vs/17/redist.txt), not a
 per-file enumeration.
 
@@ -291,8 +307,9 @@ server, run `SELECT 1`/`PING`; on Windows over TCP loopback) before it's allowed
 Surface names with trademark care in the UI: **"Redis (Valkey)"** (BSD-3) on Linux/macOS,
 plain **"Redis"** (BSD-3) on Windows; **"MySQL (Oracle)"** (GPLv2, preserve notices) /
 MariaDB (GPLv2), PostgreSQL (permissive), **Meilisearch** (MIT, Community Edition). Upstream
-license texts live in [`LICENSES/`](LICENSES/) (Windows redis carries `redis-BSD-3-Clause.txt`
-+ the port's combined `redis-windows-port-BSD-3-Clause.txt`).
+license texts live in [`LICENSES/`](LICENSES/) (Windows redis stages Redis's own `COPYING`
+from the built tree as `LICENSE`, plus `redis-windows-third-party-NOTICES.txt` and
+`msys2-runtime-LGPL-3.0.txt` for the bundled POSIX runtime).
 
 ## Meilisearch (Community Edition)
 
@@ -451,8 +468,8 @@ yerd-services/
 ├── README.md
 ├── LICENSES/                       # upstream license texts (BSD/GPL/PostgreSQL)
 │   ├── valkey-BSD-3-Clause.txt
-│   ├── redis-BSD-3-Clause.txt       # Windows redis slot (Redis pre-7.4)
-│   ├── redis-windows-port-BSD-3-Clause.txt  # tporadowski port combined notice
+│   ├── redis-BSD-3-Clause.txt       # Windows redis slot (Redis <= 7.2)
+│   ├── msys2-runtime-LGPL-3.0.txt   # msys-*.dll bundled with Windows redis (LGPLv3+)
 │   ├── redis-windows-third-party-NOTICES.txt  # Lua/hiredis/jemalloc/linenoise (linked deps)
 │   ├── mysql-GPLv2.txt
 │   ├── postgresql-PostgreSQL-License.txt

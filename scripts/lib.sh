@@ -452,6 +452,41 @@ ensure_rust() {
   command -v cargo >/dev/null 2>&1
 }
 
+# ensure_msys2: make a POSIX toolchain reachable so the Windows redis leg can build vanilla
+# Redis from source. Redis has no MSVC build — src/Makefile branches on `uname_S` for
+# Linux/SunOS/Darwin/AIX/*BSD/Haiku only, and the sources need sys/mman.h, sys/un.h,
+# syslog.h and sys/wait.h, none of which mingw-w64 provides — so a POSIX emulation layer is
+# mandatory, not a preference. MSYS2 is preinstalled at C:\msys64 on windows-latest.
+#
+# STDOUT CONTRACT: prints the installation ROOT and nothing else. Callers append
+# /usr/bin/bash.exe for the shell and /usr/bin for the runtime DLLs, so one value serves
+# both. Every diagnostic goes to stderr — the caller captures this with
+# `msys_root="$(ensure_msys2)"`, so a stray stdout line would land inside the path and turn
+# both derived values into garbage. Same shape as _vs_dir, which emits only the path.
+#
+# Returns non-zero when unavailable so the caller fails loudly (the ensure_rust contract).
+# No-op off Windows: the arm that calls this is inside the windows branch.
+ensure_msys2() {
+  [[ "$(host_os)" == windows ]] || return 0
+  local root="${MSYS2_ROOT:-/c/msys64}" bash_exe
+  bash_exe="$root/usr/bin/bash.exe"
+  [[ -x "$bash_exe" ]] || {
+    echo "ensure_msys2: no MSYS2 bash at $bash_exe (set MSYS2_ROOT)" >&2
+    return 1
+  }
+  # --needed makes this a no-op when the packages are already present, so a preinstalled
+  # runner costs nothing. Failure is tolerated here and caught by the gcc probe below:
+  # pacman can exit non-zero on a runtime self-update while still leaving a usable gcc.
+  "$bash_exe" -lc 'pacman -S --noconfirm --needed gcc make' >&2 2>&1 || true
+  "$bash_exe" -lc 'command -v gcc >/dev/null' || {
+    echo "ensure_msys2: gcc not available in MSYS2 after pacman install" >&2
+    return 1
+  }
+  # Diagnostics to STDERR — they belong in the build log, not in the caller's variable.
+  "$bash_exe" -lc 'gcc --version | head -1; pacman -Q msys2-runtime' >&2 2>&1 || true
+  printf '%s\n' "$root"
+}
+
 # ensure_mariadb_runtime_deps: install the linux-systemd bintar's runtime chain (root-aware) so
 # linux_self_contain's ldd sweep can bundle it. Tolerant per package (names vary across releases).
 ensure_mariadb_runtime_deps() {
@@ -860,10 +895,53 @@ postgres_win_url() {
   return 1
 }
 
-# redis_win_url <upstream>: native MSVC Redis-for-Windows port (tporadowski). pre-7.4 BSD.
+# --- windows redis: vanilla Redis source, version+hash pinned together ------------
+#
+# The Windows leg of the `redis` slot builds VANILLA Redis from source (see the windows
+# `redis)` arm in build-service.sh). It is not Valkey — valkey has no Windows build — and
+# it is no longer the tporadowski MSVC port, which is EOL at 5.0.14.1 (pre-ACL, pre-RESP3,
+# pre-functions) and unpatched.
+#
+# 7.2.x IS THE CEILING, for licensing: Redis 1.0-7.2 is BSD-3-Clause and freely
+# redistributable; 7.4-7.8 is RSALv2/SSPLv1; 8.0+ adds AGPLv3 to that pair. 7.2.x is
+# therefore the newest freely redistributable line. Do NOT raise these past 7.2.
+#
+# VERSION AND HASH ARE PINNED TOGETHER, DELIBERATELY. They are a matched pair, so a bump is
+# one reviewed commit touching both lines — the hash lands in version control beside the
+# version it pins, rather than being typed into a dispatch box where a stale or mistyped
+# value is invisible. There is intentionally NO per-version table and NO workflow input for
+# the hash: dispatching a non-default REDIS_WIN_UPSTREAM fails loudly (see
+# redis_win_sha256) and directs the operator here.
+REDIS_WIN_UPSTREAM_DEFAULT="7.2.15"
+# sha256 of https://download.redis.io/releases/redis-7.2.15.tar.gz, verbatim from
+# https://github.com/redis/redis-hashes (the project's own published hash list).
+REDIS_WIN_SHA256_DEFAULT="7bf7975331511fdb788e85dae63964b128fccee1df026a10db57444babc9c9c4"
+
+# redis_win_url <upstream>: the official Redis source tarball. download.redis.io is the
+# canonical distribution — redis/redis publishes no release assets for 7.2.x, so the
+# GitHub auto-generated tag tarball is not the authoritative artifact (and its bytes are
+# not contractually stable, which would make a pinned hash a maintenance liability).
 redis_win_url() {
   local up="$1" url
-  url="https://github.com/tporadowski/redis/releases/download/v${up}/Redis-x64-${up}.zip"
+  url="https://download.redis.io/releases/redis-${up}.tar.gz"
   _url_ok "$url" || { echo "redis_win_url: not found: $url" >&2; return 1; }
   echo "$url"
+}
+
+# redis_win_sha256 <upstream>: the pinned digest for <upstream>, or a loud failure telling
+# the operator how to pin a new one. Only the version pinned above has a recorded hash —
+# that is the point: an unpinned version must not build silently unverified.
+redis_win_sha256() {
+  local up="$1"
+  if [[ "$up" == "$REDIS_WIN_UPSTREAM_DEFAULT" ]]; then
+    printf '%s\n' "$REDIS_WIN_SHA256_DEFAULT"
+    return 0
+  fi
+  cat >&2 <<EOF
+redis_win_sha256: no pinned sha256 for Redis '$up' (pinned version is $REDIS_WIN_UPSTREAM_DEFAULT).
+Bumping the Windows redis version is a code change, not a dispatch parameter: update
+REDIS_WIN_UPSTREAM_DEFAULT and REDIS_WIN_SHA256_DEFAULT together in scripts/lib.sh, taking
+the digest from https://github.com/redis/redis-hashes. Keep it <= 7.2.x (7.4+ is RSALv2/SSPL).
+EOF
+  return 1
 }
