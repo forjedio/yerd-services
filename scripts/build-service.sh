@@ -511,6 +511,28 @@ if [[ "$OS" == windows ]]; then
       require_files "$stage" bin/versitygw.exe
       ;;
 
+    rustfs)
+      # RustFS ships an official prebuilt Windows binary, so this is a PURE REPACKAGE like
+      # versitygw. The zip holds the bare exe and nothing else (no LICENSE: the shared license
+      # block below ships it from LICENSES/). RustFS tags carry no leading `v`; the asset
+      # names do:
+      #   rustfs-windows-x86_64-v<up>.zip
+      rfs_tag="${upstream#v}"
+      url="https://github.com/rustfs/rustfs/releases/download/${rfs_tag}/rustfs-windows-x86_64-v${rfs_tag}.zip"
+      echo ">> rustfs(windows) source: $url"
+      fetch_to "$url" "$work/rustfs.zip"
+      unzip_vendor "$work/rustfs.zip" "$work/rustfs"
+      exe="$(find "$work/rustfs" -name 'rustfs.exe' -print -quit)"
+      [[ -n "$exe" ]] || { echo "rustfs(windows): rustfs.exe not found in zip" >&2; exit 1; }
+      cp "$exe" "$stage/bin/rustfs.exe"
+      # Unlike versitygw's static Go exe, rustfs.exe is an MSVC Rust build that imports
+      # VCRUNTIME140.dll (checked against 1.0.3), so bundle the VC++ runtime beside it the way
+      # the from-source meilisearch leg does, then let the gate prove nothing else leaks.
+      windows_bundle_runtime "$stage"
+      windows_self_contain_gate "$stage"
+      require_files "$stage" bin/rustfs.exe
+      ;;
+
     *)
       echo "build-service.sh: unhandled service '$service' (windows)" >&2
       exit 1
@@ -801,6 +823,34 @@ case "$service" in
     require_files "$stage" bin/versitygw
     ;;
 
+  rustfs)
+    # RustFS ships official prebuilt binaries per platform (Apache-2.0), so this is a pure
+    # repackage like versitygw: download the release zip for the host platform, lift out the
+    # single `rustfs` binary, and restage it under bin/. RustFS tags carry no leading `v`;
+    # the asset names do. `upstream` is accepted with or without it.
+    #
+    # Upstream asset naming (github.com/rustfs/rustfs/releases):
+    #   rustfs-linux-<x86_64|aarch64>-musl-v<up>.zip   static musl build: no glibc floor
+    #   rustfs-macos-aarch64-v<up>.zip                  links system frameworks only
+    # Both are already stripped upstream (stripping again saves nothing), and neither needs a
+    # bundled lib/. The zips hold the bare binary only, so the license block below ships
+    # LICENSE from LICENSES/. There is no macos-x86_64 asset; the matrix does not build one.
+    rfs_tag="${upstream#v}"
+    case "$OS-$ARCH" in
+      linux-x86_64|linux-aarch64) rfs_asset="rustfs-linux-${ARCH}-musl-v${rfs_tag}.zip" ;;
+      macos-aarch64)              rfs_asset="rustfs-macos-aarch64-v${rfs_tag}.zip" ;;
+      *) echo "rustfs: no upstream binary for '$OS-$ARCH'" >&2; exit 1 ;;
+    esac
+    fetch_to "https://github.com/rustfs/rustfs/releases/download/${rfs_tag}/${rfs_asset}" "$work/rustfs.zip"
+    mkdir -p "$work/rustfs"
+    unzip -q -o "$work/rustfs.zip" -d "$work/rustfs"
+    rfs_bin="$(find "$work/rustfs" -type f -name rustfs -print -quit)"
+    [[ -n "$rfs_bin" ]] || { echo "rustfs: binary not found in $rfs_asset" >&2; exit 1; }
+    cp "$rfs_bin" "$stage/bin/rustfs"
+    chmod +x "$stage/bin/rustfs"
+    require_files "$stage" bin/rustfs
+    ;;
+
   *)
     echo "build-service.sh: unhandled service '$service'" >&2
     exit 1
@@ -833,6 +883,8 @@ else
     # versitygw stages its own LICENSE + NOTICE from the upstream archive above; this
     # only backfills LICENSE if that archive ever drops it.
     versitygw) lic="$([[ -f "$stage/LICENSE" ]] && echo "" || echo versitygw-Apache-2.0.txt)" ;;
+    # rustfs release zips carry no LICENSE (upstream has no NOTICE file), so always ship it.
+    rustfs)   lic=rustfs-Apache-2.0.txt ;;
     *)        lic="" ;;
   esac
   if [[ -n "$lic" ]]; then

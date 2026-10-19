@@ -41,6 +41,8 @@ eq "meilisearch linux-x86_64"  "meilisearch-1.49.0-linux-x86_64.tar.gz"  "$(arti
 eq "meilisearch linux-aarch64" "meilisearch-1.49.0-linux-aarch64.tar.gz" "$(artifact_filename meilisearch 1.49.0 linux aarch64)"
 eq "meilisearch macos-aarch64" "meilisearch-1.49.0-macos-aarch64.tar.gz" "$(artifact_filename meilisearch 1.49.0 macos aarch64)"
 eq "canonical_service passthrough" "meilisearch" "$(canonical_service meilisearch)"
+eq "canonical_service rustfs passthrough" "rustfs" "$(canonical_service rustfs)"
+eq "rustfs windows-x86_64" "rustfs-1.0.3-windows-x86_64.tar.gz" "$(artifact_filename rustfs 1.0.3 windows x86_64)"
 # The Windows redis leg publishes under its OWN Redis version, not the Valkey label.
 eq "redis windows 7.2.15" "redis-7.2.15-windows-x86_64.tar.gz" "$(artifact_filename redis 7.2.15 windows x86_64)"
 eq "canonical_service valkey->redis" "redis" "$(canonical_service valkey)"
@@ -84,6 +86,12 @@ plats="$(jq -c '.services.meilisearch.versions[0].platforms' <<<"$mani")"
 contains "has linux-x86_64"  "$plats" '"linux-x86_64"'
 contains "has linux-aarch64" "$plats" '"linux-aarch64"'
 contains "has macos-aarch64" "$plats" '"macos-aarch64"'
+
+echo "== 4a. services.json rustfs entry covers all four platforms =="
+names_rfs=$'rustfs-1.0.3-linux-x86_64.tar.gz\nrustfs-1.0.3-linux-aarch64.tar.gz\nrustfs-1.0.3-macos-aarch64.tar.gz\nrustfs-1.0.3-windows-x86_64.tar.gz'
+mani_rfs="$(printf '%s\n' "$names_rfs" | "$gen")"
+eq "rustfs version"        "1.0.3" "$(jq -r '.services.rustfs.versions[0].version' <<<"$mani_rfs")"
+eq "rustfs platform count" "4"     "$(jq -r '.services.rustfs.versions[0].platforms | length' <<<"$mani_rfs")"
 
 echo "== 4b. redis slot: version lists are disjoint per platform =="
 # The post-cutover redis asset set. This pins the whole point of the Windows rename as a
@@ -184,6 +192,67 @@ EOF
   else
     ok "smoke fails for an unhealthy meilisearch"
   fi
+fi
+
+echo "== 6b. rustfs launch + /health smoke-test validation =="
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "  SKIP (python3 unavailable for the mock server)"
+else
+  # A mock 'rustfs' that honors `server --address host:port <dir>` and serves /health. It
+  # refuses to start unless the console is switched off, so a harness that forgets
+  # RUSTFS_CONSOLE_ENABLE=false fails here instead of opening :9001 on a shared runner.
+  # MOCK_MODE=ok -> 200 {"status":"ok"}; starting -> 200 {"status":"starting"}; else 503.
+  mkrustfs() {
+    local s mode="$1"; s="$(make_stage)"
+    cat >"$s/bin/rustfs" <<EOF
+#!/usr/bin/env bash
+[[ "\${RUSTFS_CONSOLE_ENABLE:-}" == "false" ]] || { echo "console not disabled" >&2; exit 2; }
+addr=""
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    --address) addr="\$2"; shift 2;;
+    *) shift;;
+  esac
+done
+host="\${addr%%:*}"; port="\${addr##*:}"
+exec python3 - "\$host" "\$port" "$mode" <<'PY'
+import sys, json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+host, port, mode = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health" and mode in ("ok", "starting"):
+            b = json.dumps({"service": "rustfs-endpoint", "status": mode}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers(); self.wfile.write(b)
+        else:
+            self.send_response(503); self.end_headers()
+    def log_message(self, *a): pass
+HTTPServer((host, port), H).serve_forever()
+PY
+EOF
+    chmod +x "$s/bin/rustfs"
+    printf 'Apache-2.0\n' > "$s/LICENSE"
+    echo "$s"
+  }
+
+  rs="$(mkrustfs ok)"; rt="$work/rustfs-ok.tar.gz"; pack_stage "$rs" "$rt"; rm -rf "$rs"
+  if "$smoke" rustfs "$rt" >"$work/smoke-rustfs-ok.log" 2>&1; then
+    ok "smoke passes for a healthy rustfs"
+  else
+    bad "smoke passes for a healthy rustfs" "$(tail -3 "$work/smoke-rustfs-ok.log" | tr '\n' '|')"
+  fi
+
+  for mode in starting down; do
+    rs="$(mkrustfs "$mode")"; rt="$work/rustfs-$mode.tar.gz"; pack_stage "$rs" "$rt"; rm -rf "$rs"
+    if RUSTFS_HEALTH_TRIES=3 "$smoke" rustfs "$rt" >"$work/smoke-rustfs-$mode.log" 2>&1; then
+      bad "smoke fails for a rustfs reporting '$mode'" "unexpectedly exited 0"
+    else
+      ok "smoke fails for a rustfs reporting '$mode'"
+    fi
+  done
 fi
 
 echo "== 8. CDN reconcile plan classification =="

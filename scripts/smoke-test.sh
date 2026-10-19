@@ -48,7 +48,7 @@ cleanup() {
   # fires in CI (avoid taskkilling a dev box's own engines by image name).
   if [[ "$OS" == windows && -n "${GITHUB_ACTIONS:-}${CI:-}" ]]; then
     local img
-    for img in redis-server.exe mysqld.exe mariadbd.exe postgres.exe meilisearch.exe versitygw.exe; do
+    for img in redis-server.exe mysqld.exe mariadbd.exe postgres.exe meilisearch.exe versitygw.exe rustfs.exe; do
       taskkill //IM "$img" //F >/dev/null 2>&1 || true
     done
   fi
@@ -70,6 +70,37 @@ wait_for() {
   done
   echo "smoke-test: timed out waiting for: $*" >&2
   return 1
+}
+
+# rustfs_smoke <exe>: start the packaged RustFS on a loopback port over a throwaway volume
+# and require GET /health to answer 200 with {"status":"ok"}. Shared by the unix and
+# windows legs, which differ only in the exe name. The console is switched off on purpose:
+# RustFS otherwise opens it on every interface at :9001 even without --console-enable,
+# which Yerd also disables, and which would collide on a shared runner.
+rustfs_smoke() {
+  local exe="$1" logf="$extract/rustfs.log" healthf="$extract/rustfs-health.json"
+  local tries="${RUSTFS_HEALTH_TRIES:-60}" ok="" code i
+  mkdir -p "$data"
+  RUSTFS_CONSOLE_ENABLE=false RUSTFS_ACCESS_KEY=smoke RUSTFS_SECRET_KEY=smokesmokesmoke \
+    "$exe" server --address "127.0.0.1:$port" "$data" >"$logf" 2>&1 &
+  srv_pid=$!
+  for (( i=0; i<tries; i++ )); do
+    code="$(curl -sS -o "$healthf" -w '%{http_code}' "http://127.0.0.1:$port/health" 2>/dev/null || echo 000)"
+    if [[ "$code" == "200" ]]; then ok=1; break; fi
+    kill -0 "$srv_pid" 2>/dev/null || { echo "rustfs: server exited before becoming healthy" >&2; break; }
+    sleep 0.5
+  done
+  if [[ -z "$ok" ]]; then
+    echo "rustfs: /health did not return HTTP 200 within ${tries} tries" >&2
+    echo "---- rustfs log ----" >&2; cat "$logf" >&2 2>/dev/null || true
+    exit 1
+  fi
+  if ! grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' "$healthf"; then
+    echo "rustfs: /health returned 200 but body lacks {\"status\":\"ok\"}:" >&2
+    cat "$healthf" >&2 2>/dev/null || true
+    echo "---- rustfs log ----" >&2; cat "$logf" >&2 2>/dev/null || true
+    exit 1
+  fi
 }
 
 echo ">> smoke-testing $service from $tarball"
@@ -277,6 +308,11 @@ SQL
         echo "---- versitygw log ----" >&2; cat "$logf" >&2 2>/dev/null || true
         exit 1
       fi
+      ;;
+
+    rustfs)
+      [[ -f "$bin/rustfs.exe" ]] || { echo "rustfs: bin/rustfs.exe missing" >&2; exit 1; }
+      rustfs_smoke "$bin/rustfs.exe"
       ;;
 
     *)
@@ -493,6 +529,13 @@ SQL
       exit 1
     fi
     # Graceful shutdown handled by the EXIT trap (SIGTERM -> versitygw exits, then reaped).
+    ;;
+
+  rustfs)
+    # Smoke the FINAL packaged binary from its extracted (relocated) location.
+    [[ -x "$bin/rustfs" ]] || { echo "rustfs: bin/rustfs missing or not executable" >&2; exit 1; }
+    rustfs_smoke "$bin/rustfs"
+    # Graceful shutdown handled by the EXIT trap (SIGTERM -> rustfs exits in ~0.5s, then reaped).
     ;;
 
   *)
