@@ -77,8 +77,8 @@ canonical_service() {
   local in="${1:-}"
   case "$in" in
     valkey|redis)                                  echo redis ;;
-    mysql|mariadb|postgres|meilisearch|versitygw)  echo "$in" ;;
-    *) echo "lib.sh: unknown service '$in' (want valkey|redis|mysql|mariadb|postgres|meilisearch|versitygw)" >&2; return 1 ;;
+    mysql|mariadb|postgres|meilisearch|versitygw|rustfs)  echo "$in" ;;
+    *) echo "lib.sh: unknown service '$in' (want valkey|redis|mysql|mariadb|postgres|meilisearch|versitygw|rustfs)" >&2; return 1 ;;
   esac
 }
 

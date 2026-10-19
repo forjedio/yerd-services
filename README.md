@@ -28,6 +28,7 @@ It is intentionally **isolated** from the main app:
 | `mariadb`  | MariaDB (GPLv2) | 3 | ✅ implemented (repackage x86_64 + build from source for ARM/macOS) |
 | `meilisearch` | Meilisearch **Community Edition** (MIT) | 4 | ✅ implemented (build from source, all platforms) |
 | `versitygw` | [versitygw](https://github.com/versity/versitygw) S3 gateway (Apache-2.0) | _(rolling)_ | ✅ implemented (repackage prebuilt binary, all platforms) |
+| `rustfs` | [RustFS](https://github.com/rustfs/rustfs) S3-compatible object storage (Apache-2.0) | _(rolling)_ | ✅ implemented (repackage prebuilt binary, all platforms) |
 
 The `redis` slot ships **[Valkey](https://github.com/valkey-io/valkey)** (Linux Foundation,
 BSD-3, wire-compatible) because Redis 7.4+ is SSPL/RSALv2 (redistribution-restricted).
@@ -75,7 +76,7 @@ This is the entire coupling with `forjedio/yerd`. The consumer there
 this shape.
 
 **Filename:** `<service-id>-<version>-<os>-<arch>.tar.gz`
-- `service-id ∈ redis | mysql | mariadb | postgres | meilisearch | versitygw` (the `redis` slot is
+- `service-id ∈ redis | mysql | mariadb | postgres | meilisearch | versitygw | rustfs` (the `redis` slot is
   served by Valkey on Linux/macOS, and by the native MSVC Redis port on Windows — see below)
 - `os ∈ linux | macos | windows`, `arch ∈ x86_64 | aarch64` (Windows is `x86_64` only)
 - examples: `redis-8-linux-x86_64.tar.gz`, `postgres-16-macos-aarch64.tar.gz`,
@@ -95,6 +96,7 @@ and points data/socket/port at user paths via config, never compiled-in defaults
 | `postgres` | `postgres` | `initdb`, `pg_ctl`, `psql`, `createdb`, `pg_dump`, `pg_dumpall`, `pg_restore` |
 | `meilisearch` | `meilisearch` | _(single self-contained binary; no client/init tools)_ |
 | `versitygw` | `versitygw` | _(single self-contained binary; no client/init tools)_ |
+| `rustfs` | `rustfs` | _(single self-contained binary; no client/init tools)_ |
 
 **Windows differs** from the table above:
 - Executables carry `.exe` (`mysqld.exe`, `postgres.exe`, …). Only the **server binary** is
@@ -264,6 +266,7 @@ group, so a queued run can be superseded by a later dispatch).
 | `mariadb` | _(label)_ | [archive.mariadb.org](https://archive.mariadb.org/) `<upstream>` (e.g. 11.8.8 LTS) | repackage (linux-x86_64) / build from source (ARM Linux + macOS) | MariaDB ships only a `linux-systemd-x86_64` bintar; CMake build for the rest (`-DWITH_SSL=system`, heavy plugins trimmed). `bin/{mariadbd,mariadb,mariadb-install-db,my_print_defaults,mariadb-dump,…}` + `lib/`+`share/`; made relocatable + self-contained |
 | `meilisearch` | _(label)_ | [Meilisearch](https://github.com/meilisearch/meilisearch) source tag `<upstream>` (e.g. `v1.49.0`) | build from source (all platforms) | **Community Edition** via `cargo build --release --locked -p meilisearch` (default features — the `enterprise` feature is **not** enabled, so BUSL-1.1 EE code is compiled out; MIT-only). Rust toolchain auto-selected from the source's `rust-toolchain.toml`. Single self-contained `bin/meilisearch` (`bin/meilisearch.exe` on Windows, where the VC++ runtime is bundled; no `lib/`). **No `macos-x86_64` leg** — see [Platform matrix](#platform-matrix) |
 | `versitygw` | _(label)_ | [versitygw](https://github.com/versity/versitygw) release tag `<upstream>` (e.g. `1.7.0`) | repackage prebuilt (all platforms) | **Pure repackage, no toolchain**: download upstream's official static Go binary (`versitygw_v<up>_<Darwin\|Linux>_<x86_64\|arm64>.tar.gz`; `…_Windows_x86_64.zip` on Windows), lift out `bin/versitygw` (`bin/versitygw.exe` on Windows), ship its `LICENSE` + `NOTICE` (Apache-2.0). Single self-contained binary (no `lib/`). **Windows note:** the exe imports only `kernel32.dll` (static Go), so nothing is bundled, but its posix backend needs `--sidecar` at runtime — see the Windows table below |
+| `rustfs` | _(label)_ | [RustFS](https://github.com/rustfs/rustfs) release tag `<upstream>` (e.g. `1.0.3`; tags carry no `v`) | repackage prebuilt (all platforms) | **Pure repackage, no toolchain**: download upstream's official binary zip (`rustfs-linux-<x86_64\|aarch64>-musl-v<up>.zip`, `rustfs-macos-aarch64-v<up>.zip`; `rustfs-windows-x86_64-v<up>.zip` on Windows) and lift out `bin/rustfs` (`bin/rustfs.exe`). The Linux build is **static musl** (no glibc floor) and the macOS build links only system frameworks, so no `lib/` is bundled; both are already stripped upstream. The zips carry no LICENSE, so `LICENSES/rustfs-Apache-2.0.txt` is always shipped (upstream has no NOTICE). Upstream publishes no macos-x86_64 binary, which the matrix does not build anyway. Expect ~95 MB per compressed artifact. |
 
 **Windows (`windows-x86_64`)** — all repackaged from official vendor zips (no service has a
 native Windows ARM64 build, so Windows is x86_64-only; Windows-on-ARM runs x64 via emulation):
@@ -276,6 +279,7 @@ native Windows ARM64 build, so Windows is x86_64-only; Windows-on-ARM runs x64 v
 | `postgres` | [EDB](https://www.enterprisedb.com/download-postgresql-binaries) `postgresql-<upstream>-<N>-windows-x64-binaries.zip` | repackage `pgsql/{bin,lib,share}`; the build-number `<N>` is set via `postgres_win_buildno` (else probed). The EDB zip already carries the contrib extensions (shipped via the verbatim `lib/`+`share/` copy); **pgvector is not bundled on Windows** — see [Bundled extensions](#bundled-extensions) |
 | `meilisearch` | _(from source)_ [Meilisearch](https://github.com/meilisearch/meilisearch) source tag `<upstream>` | **Not repackaged** — built from Rust source with `cargo build --release --locked -p meilisearch` on the windows runner, identical CE recipe to the Unix legs, emitting `bin/meilisearch.exe`. Rust's MSVC target dynamically links the VC++ runtime, so those DLLs are bundled into `bin/` and pass `windows_self_contain_gate` |
 | `versitygw` | [versitygw](https://github.com/versity/versitygw) `versitygw_v<up>_Windows_x86_64.zip` | repackage the single `bin/versitygw.exe`. It is a **static Go binary** importing only `kernel32.dll`, so no VC++ runtime is bundled (the gate still runs and passes). **Runtime divergence:** versitygw's posix backend stores S3 object metadata in POSIX extended attributes, which NTFS lacks — on Windows it must be launched with `--sidecar <dir>` (metadata in a directory) or `--nometa`; the daemon must pass this for Windows installs. The smoke test exercises the `--sidecar` path |
+| `rustfs` | [RustFS](https://github.com/rustfs/rustfs) `rustfs-windows-x86_64-v<up>.zip` | repackage the single `bin/rustfs.exe`. Unlike versitygw it is an **MSVC Rust build that imports `VCRUNTIME140.dll`** (checked against 1.0.3), so the VC++ runtime is bundled beside it via `windows_bundle_runtime`, exactly like the from-source meilisearch leg, and the gate proves nothing else leaks. The smoke test starts it with `RUSTFS_CONSOLE_ENABLE=false`, because RustFS otherwise opens its web console on every interface at `:9001`. |
 
 Every Windows artifact that links the VC++ runtime bundles those DLLs into `bin/`, and **all**
 pass `windows_self_contain_gate` (a `dumpbin -dependents` check, mandatory in CI). The lone
@@ -482,7 +486,8 @@ yerd-services/
 │   ├── json-c-MIT.txt                  #   "   (MIT)
 │   ├── protobuf-c-BSD-2-Clause.txt     #   "   (BSD-2)
 │   ├── meilisearch-MIT.txt             # Meilisearch Community Edition (MIT)
-│   └── versitygw-Apache-2.0.txt        # versitygw S3 gateway (Apache-2.0; backfill only)
+│   ├── versitygw-Apache-2.0.txt        # versitygw S3 gateway (Apache-2.0; backfill only)
+│   └── rustfs-Apache-2.0.txt           # RustFS object storage (Apache-2.0; always shipped)
 │                                       # TimescaleDB notices are copied from its source tree at
 │                                       # build time (LICENSE-timescaledb*, NOTICE-timescaledb)
 ├── scripts/

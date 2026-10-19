@@ -22,7 +22,7 @@ on:
         type: choice
         required: true
         default: valkey
-        options: [valkey, redis, mysql, mariadb, postgres, meilisearch, versitygw]
+        options: [valkey, redis, mysql, mariadb, postgres, meilisearch, versitygw, rustfs]
       version:
         description: the published label users install (e.g. 8, 8.4, 16)
         type: string
