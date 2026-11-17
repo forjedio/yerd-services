@@ -539,3 +539,8 @@ on the same native runners, so no glibc floor or macOS deployment target is sile
 **daemon-side runtime prerequisite** for Windows versitygw installs — the label/install path itself
 needs no change, but the launcher must add `--sidecar` on Windows. The build's smoke test starts it
 exactly that way, so it validates the invocation the daemon will use.
+
+## License
+
+The build scripts and tooling in this repository are licensed under the [MIT License](LICENSE.md), the same as [yerd](https://github.com/forjedio/yerd).
+The service artifacts built here remain under their upstream licenses; see [`LICENSES/`](LICENSES/).
